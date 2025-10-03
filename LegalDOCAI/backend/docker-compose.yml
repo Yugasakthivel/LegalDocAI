@@ -1,0 +1,28 @@
+version: "3.9"
+
+services:
+  backend:
+    build: .
+    container_name: legaldocai-backend
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongo
+    volumes:
+      - ./app:/app/app
+      - ./uploads:/app/uploads
+    environment:
+      - MONGO_URI=mongodb://mongo:27017
+      - DB_NAME=legaldocai
+      - UPLOAD_DIR=/app/uploads
+
+  mongo:
+    image: mongo:6.0
+    container_name: legaldocai-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+
+volumes:
+  mongo_data:
