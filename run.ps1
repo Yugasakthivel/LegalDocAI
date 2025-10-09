@@ -1,23 +1,30 @@
-# run.ps1
-# ----------------------------------------
-# Activate virtual environment
-# ----------------------------------------
-Write-Host "Activating virtual environment..."
-& D:/Project/LegalDocAI/venv/Scripts/Activate.ps1
+# 🚀 LegalDocAI Project Auto Runner
+# ---------------------------------
+# This script starts both FastAPI backend and React frontend
 
-# ----------------------------------------
-# Set current folder as working directory
-# ----------------------------------------
-Set-Location "D:\Project\LegalDocAI\LegalDOCAI"
+Write-Host "Starting LegalDocAI Backend & Frontend..." -ForegroundColor Cyan
 
-# ----------------------------------------
-# Add current folder to PYTHONPATH
-# ----------------------------------------
-$env:PYTHONPATH = Get-Location
-Write-Host "PYTHONPATH set to $env:PYTHONPATH"
+# ---- BACKEND ----
+Write-Host "`nStarting Backend Server (FastAPI)..." -ForegroundColor Yellow
+Start-Process powershell -ArgumentList @(
+    "-NoExit",
+    "-Command",
+    "cd D:\Project\LegalDocAI\LegalDOCAI;
+     .\venv\Scripts\Activate.ps1;
+     python -m spacy download en_core_web_sm;
+     uvicorn main:app --reload"
+)
 
-# ----------------------------------------
-# Start FastAPI app with uvicorn
-# ----------------------------------------
-Write-Host "🚀 Starting FastAPI app..."
-uvicorn main:app --reload --host 127.0.0.1 --port 8000
+# ---- FRONTEND ----
+Write-Host "`nStarting Frontend (React/Vite)..." -ForegroundColor Yellow
+Start-Process powershell -ArgumentList @(
+    "-NoExit",
+    "-Command",
+    "cd D:\Project\LegalDoc-FrontEnd;
+     npm install;
+     npm run dev"
+)
+
+Write-Host "`n✅ Both Backend and Frontend are launching in separate terminals." -ForegroundColor Green
+Write-Host "Backend: http://127.0.0.1:8000"
+Write-Host "Frontend: http://localhost:5173"
