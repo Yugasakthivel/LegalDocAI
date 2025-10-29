@@ -38,5 +38,8 @@ This project aims to save time for legal professionals by providing instant, int
 
 ### 1️⃣ Clone the Repositories
 ```bash
+# Clone Backend
 git clone https://github.com/Yugasakthivel/LegalDocAI-Backend.git
+
+# Clone Frontend
 git clone https://github.com/Yugasakthivel/LegalDocAI-Frontend.git
