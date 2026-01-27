@@ -5,6 +5,7 @@ from app.config import settings
 from app.models.schemas import UploadResponse
 from app.utils.validators import validate_file, sanitize_filename
 from app.services import extract_text_from_file, analyze_legal_document
+from app.services.database_service import save_document_analysis
 
 router = APIRouter()
 
@@ -41,6 +42,13 @@ async def upload_document(file: UploadFile = File(...)):
     except Exception as e:
         os.remove(file_path)
         raise HTTPException(status_code=500, detail=f"Failed to analyze document: {str(e)}")
+    
+    doc_id = save_document_analysis(
+        filename=file.filename,
+        file_type=file_type,
+        extracted_text=extracted_text,
+        analysis=analysis
+    )
     
     response = UploadResponse(
         status="success",

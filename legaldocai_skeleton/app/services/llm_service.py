@@ -23,22 +23,7 @@ INDIAN_LEGAL_DOCUMENT_TYPES = [
 
 def analyze_legal_document(text: str, document_type: str = "Unknown") -> AnalysisResult:
     """
-    Analyze legal document using LLM.
-    
-    PLACEHOLDER IMPLEMENTATION
-    Future integration:
-    - OpenAI GPT-4 or Anthropic Claude for analysis
-    - Custom prompt templates for Indian legal documents
-    - Chain-of-thought reasoning for complex documents
-    - Confidence scoring based on LLM outputs
-    
-    Analysis tasks to implement:
-    1. Document classification (Sale Deed, Lease, Court Order, etc.)
-    2. Entity extraction (NER for Indian legal entities)
-    3. Clause identification and categorization
-    4. Legal explanation in simple English
-    5. Risk assessment (missing clauses, vague terms)
-    6. Compliance checking (Registration Act, Stamp Duty, etc.)
+    Analyze legal document using OpenAI LLM.
     
     Args:
         text: Extracted document text
@@ -48,44 +33,102 @@ def analyze_legal_document(text: str, document_type: str = "Unknown") -> Analysi
         AnalysisResult with structured analysis
     """
     
-    placeholder_analysis = AnalysisResult(
-        document_type="Unknown (LLM integration pending)",
-        summary_simple=(
-            "This document appears to be a legal document. "
-            "Full analysis will be available after LLM integration with OpenAI/Anthropic. "
-            "The system will identify document type, extract entities, detect clauses, "
-            "and provide risk assessment based on Indian legal context."
-        ),
+    if not client:
+        return _placeholder_analysis()
+    
+    if not text or len(text.strip()) < 50:
+        return _placeholder_analysis("Document text is too short for analysis")
+    
+    text_preview = text[:4000]
+    
+    prompt = f"""You are an expert AI legal assistant specializing in Indian legal documents.
+
+Analyze the following Indian legal document and provide a structured JSON response.
+
+Document text:
+{text_preview}
+
+Provide analysis in this EXACT JSON format:
+{{
+  "document_type": "<one of: {', '.join(INDIAN_LEGAL_DOCUMENT_TYPES)}>",
+  "summary_simple": "<explain in simple English what this document is and its purpose>",
+  "entities": {{
+    "parties": ["list of people/organizations involved"],
+    "dates": ["important dates in DD-MM-YYYY or text format"],
+    "amounts": ["monetary amounts with Rs/₹ symbol"],
+    "properties": ["property details, survey numbers, addresses"],
+    "case_numbers": ["court case numbers, registration numbers"],
+    "courts": ["courts or authorities mentioned"]
+  }},
+  "clauses": ["list of important clauses like ownership, payment, termination, jurisdiction"],
+  "key_terms": ["important legal terms and concepts"],
+  "risk_analysis": {{
+    "level": "<LOW, MEDIUM, or HIGH>",
+    "details": ["specific risks, missing clauses, vague language, issues found"]
+  }},
+  "compliance_flags": ["Indian legal compliance items: registration, stamp duty, witnesses, etc."],
+  "confidence_score": <0.0 to 1.0>
+}}
+
+Return ONLY valid JSON, no additional text."""
+    
+    try:
+        response = client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "You are an expert Indian legal document analyst. Always respond with valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.3,
+            max_tokens=2000
+        )
+        
+        content = response.choices[0].message.content.strip()
+        
+        json_match = re.search(r'\{.*\}', content, re.DOTALL)
+        if json_match:
+            content = json_match.group(0)
+        
+        analysis_data = json.loads(content)
+        
+        return AnalysisResult(
+            document_type=analysis_data.get("document_type", "Unknown Legal Document"),
+            summary_simple=analysis_data.get("summary_simple", "Analysis completed"),
+            entities=EntityData(**analysis_data.get("entities", {})),
+            clauses=analysis_data.get("clauses", []),
+            key_terms=analysis_data.get("key_terms", []),
+            risk_analysis=RiskAnalysis(**analysis_data.get("risk_analysis", {"level": "UNKNOWN", "details": []})),
+            compliance_flags=analysis_data.get("compliance_flags", []),
+            confidence_score=float(analysis_data.get("confidence_score", 0.7))
+        )
+    
+    except json.JSONDecodeError as e:
+        print(f"JSON decode error: {e}")
+        return _placeholder_analysis(f"LLM response parsing failed: {e}")
+    
+    except Exception as e:
+        print(f"LLM analysis error: {e}")
+        return _placeholder_analysis(f"LLM analysis failed: {str(e)}")
+
+def _placeholder_analysis(reason: str = "OpenAI API key not configured") -> AnalysisResult:
+    """Fallback placeholder analysis when LLM is unavailable"""
+    return AnalysisResult(
+        document_type="Unknown (LLM not available)",
+        summary_simple=f"LLM analysis unavailable. Reason: {reason}. Please configure OPENAI_API_KEY in .env file.",
         entities=EntityData(
-            parties=["[Placeholder] Party identification pending"],
-            dates=["[Placeholder] Date extraction pending"],
-            amounts=["[Placeholder] Amount extraction pending"],
-            properties=["[Placeholder] Property details extraction pending"],
-            case_numbers=["[Placeholder] Case number extraction pending"],
-            courts=["[Placeholder] Court/authority identification pending"]
+            parties=["LLM integration required"],
+            dates=[],
+            amounts=[],
+            properties=[],
+            case_numbers=[],
+            courts=[]
         ),
-        clauses=[
-            "[Placeholder] Ownership clause detection pending",
-            "[Placeholder] Payment terms detection pending",
-            "[Placeholder] Termination clause detection pending",
-            "[Placeholder] Jurisdiction clause detection pending"
-        ],
-        key_terms=[
-            "[Placeholder] Legal term extraction pending"
-        ],
+        clauses=["LLM integration required for clause detection"],
+        key_terms=[],
         risk_analysis=RiskAnalysis(
             level="UNKNOWN",
-            details=[
-                "Risk assessment requires LLM integration",
-                "Will check for: missing mandatory clauses, vague language, conflicting terms",
-                "Indian legal compliance checks: Registration requirement, stamp duty, witness signatures"
-            ]
+            details=["Configure OpenAI API key to enable risk analysis"]
         ),
-        compliance_flags=[
-            "[Placeholder] Compliance checking requires LLM + rules engine",
-            "Future checks: Transfer of Property Act, Indian Contract Act, Registration Act"
-        ],
+        compliance_flags=["LLM integration required for compliance checking"],
         confidence_score=0.0
     )
-    
-    return placeholder_analysis

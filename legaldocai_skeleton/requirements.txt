@@ -12,3 +12,6 @@ Pillow==10.4.0
 
 # LLM Integration
 openai==1.50.2
+
+# Database
+pymongo==4.7.3

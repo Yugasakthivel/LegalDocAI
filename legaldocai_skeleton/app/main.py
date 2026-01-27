@@ -1,12 +1,12 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from app.config import settings
-from app.routes import upload, health
+from app.routes import upload, health, history
 
 app = FastAPI(
     title=settings.APP_NAME,
     version=settings.VERSION,
-    description="AI system for analyzing Indian legal documents (Backend Skeleton)"
+    description="AI system for analyzing Indian legal documents"
 )
 
 app.add_middleware(
@@ -19,6 +19,7 @@ app.add_middleware(
 
 app.include_router(health.router, tags=["Health"])
 app.include_router(upload.router, prefix="/api", tags=["Upload"])
+app.include_router(history.router, prefix="/api", tags=["History & Analytics"])
 
 @app.get("/")
 def root():
