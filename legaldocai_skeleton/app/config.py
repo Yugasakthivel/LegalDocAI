@@ -16,6 +16,11 @@ class Settings:
     
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
+    TESSERACT_CMD: str = os.getenv("TESSERACT_CMD", "")
+    
+    OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
+    OPENAI_MODEL: str = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    
     @property
     def max_upload_size_bytes(self) -> int:
         return self.MAX_UPLOAD_SIZE_MB * 1024 * 1024

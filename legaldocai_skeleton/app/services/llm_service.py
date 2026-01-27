@@ -1,4 +1,25 @@
+import json
+import re
+from typing import Optional
+from openai import OpenAI
 from app.models.schemas import AnalysisResult, EntityData, RiskAnalysis
+from app.config import settings
+
+client = None
+if settings.OPENAI_API_KEY and not settings.OPENAI_API_KEY.startswith("sk-your"):
+    try:
+        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    except Exception as e:
+        print(f"Warning: Failed to initialize OpenAI client: {e}")
+
+INDIAN_LEGAL_DOCUMENT_TYPES = [
+    "Sale Deed", "Lease Deed", "Rental Agreement", "Gift Deed", 
+    "Patta", "Town Survey Land Register (TSLR)", "Encumbrance Certificate",
+    "Court Judgment", "Court Order", "Legal Notice", "Affidavit",
+    "Employment Contract", "Partnership Deed", "Corporate Agreement",
+    "Power of Attorney", "Will", "Trust Deed", "Mortgage Deed",
+    "Unknown Legal Document"
+]
 
 def analyze_legal_document(text: str, document_type: str = "Unknown") -> AnalysisResult:
     """
