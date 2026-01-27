@@ -1,13 +1,23 @@
 from pydantic import BaseModel, Field
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+
+class PartyInfo(BaseModel):
+    name: str = Field(description="Name of party")
+    role: Optional[str] = Field(default=None, description="Role: buyer, seller, petitioner, respondent, employer, employee, etc.")
 
 class EntityData(BaseModel):
-    parties: List[str] = Field(default_factory=list, description="Parties involved in the document")
+    parties: List[PartyInfo] = Field(default_factory=list, description="Parties involved with their roles")
     dates: List[str] = Field(default_factory=list, description="Important dates")
     amounts: List[str] = Field(default_factory=list, description="Monetary amounts (₹)")
     properties: List[str] = Field(default_factory=list, description="Property details (survey numbers, addresses)")
-    case_numbers: List[str] = Field(default_factory=list, description="Case/registration numbers")
+    survey_numbers: List[str] = Field(default_factory=list, description="Survey numbers and plot identifiers")
+    case_numbers: List[str] = Field(default_factory=list, description="Case numbers")
+    registration_numbers: List[str] = Field(default_factory=list, description="Registration numbers")
     courts: List[str] = Field(default_factory=list, description="Courts or authorities mentioned")
+
+class ClauseInfo(BaseModel):
+    category: str = Field(description="Clause category: ownership, payment, termination, rights_obligations, penalties, jurisdiction, other")
+    content: str = Field(description="Clause text or summary")
 
 class RiskAnalysis(BaseModel):
     level: str = Field(description="Risk level: LOW, MEDIUM, HIGH, UNKNOWN")
@@ -17,7 +27,7 @@ class AnalysisResult(BaseModel):
     document_type: str = Field(description="Type of legal document")
     summary_simple: str = Field(description="Simple English explanation of the document")
     entities: EntityData = Field(description="Extracted entities from the document")
-    clauses: List[str] = Field(default_factory=list, description="Identified clauses")
+    clauses: List[ClauseInfo] = Field(default_factory=list, description="Identified and categorized clauses")
     key_terms: List[str] = Field(default_factory=list, description="Important legal terms")
     risk_analysis: RiskAnalysis = Field(description="Risk assessment")
     compliance_flags: List[str] = Field(default_factory=list, description="Compliance issues or requirements")
