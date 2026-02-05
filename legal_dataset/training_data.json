@@ -1,0 +1,20 @@
+[
+  {"category": "Sale Deed", "text": "This DEED OF SALE is made at Chennai on this 5th day of April, 2023, between John Doe (Vendor) and Jane Smith (Vendee). The Vendor hereby sells, conveys and transfers the property absolutely to the Vendee. Consideration amount Rs. 50,00,000."},
+  {"category": "Sale Deed", "text": "ABSOLUTE SALE DEED. The Vendor is the absolute owner of the scheduled property. In consideration of the sum paid, the Vendor conveys the title to the Purchaser free from all encumbrances. Signed Witness."},
+  {"category": "Lease Deed", "text": "This LEASE DEED is executed on 10th March 2024 by Landlord Kumar. The Lessee shall pay a monthly rent of Rs. 15,000. The lease is for 11 months. Advance amount Rs. 1,00,000."},
+  {"category": "Lease Deed", "text": "DEED OF LEASE. This indenture witnesseth that the Lessor grants the Lessee the right to use the premises for commercial purpose. Rent is payable on 5th of every month."},
+  {"category": "Rental Agreement", "text": "RENTAL AGREEMENT entered into between Landlord Ravi and Tenant Suresh. The Tenant agrees to pay rent of Rs. 8000 per month. The house is for residential use only."},
+  {"category": "Gift Deed", "text": "This DEED OF GIFT is made by Father to Son. Out of natural love and affection, the Donor hereby gifts the property to the Donee without any monetary consideration."},
+  {"category": "Patta", "text": "GOVERNMENT OF TAMIL NADU. Patta No: 1234. Owner: Rajesh. Survey No: 45/2. Wet Land. Dist: Kancheepuram."},
+  {"category": "Town Survey Land Register (TSLR)", "text": "Town Survey Land Register (TSLR) Extract. Ward: 5. Block: 12. Town Survey No: 100. Classification: Private Holding. Usage: Residential."},
+  {"category": "Encumbrance Certificate", "text": "ENCUMBRANCE CERTIFICATE. Application No: 9999. Statement of Encumbrance on Property. Period: 01-01-2000 to 01-01-2023. Nil Encumbrance."},
+  {"category": "Court Judgment", "text": "IN THE HIGH COURT OF JUDICATURE AT MADRAS. W.P. No. 12345/2023. Petitioner vs Respondent. JUDGMENT. The court finds that the petitioner has valid grounds... Case dismissed."},
+  {"category": "Court Order", "text": "INTERIM ORDER. It is hereby ordered that the status quo be maintained by both parties until further orders. Case adjourned to next week."},
+  {"category": "Legal Notice", "text": "LEGAL NOTICE under Section 138 of Negotiable Instruments Act. To Mr. X. You have dishonored the cheque no 123456. Demand for payment within 15 days."},
+  {"category": "Affidavit", "text": "AFFIDAVIT. I, John, son of Peter, do hereby solemnly affirm and declare that the facts stated above are true to the best of my knowledge. Sworn before Notary."},
+  {"category": "Petition", "text": "WRIT PETITION under Article 226 of the Constitution of India. The petitioner prays for a writ of Mandamus directing the respondent to consider the representation."},
+  {"category": "Employment Contract", "text": "EMPLOYMENT AGREEMENT between ABC Corp and Employee. Position: Software Engineer. Salary: Rs. 50,000 per month. Termination notice: 2 months."},
+  {"category": "Partnership Deed", "text": "DEED OF PARTNERSHIP. Made between Partner A and Partner B. Carrying on business under the name XYZ Enterprises. Profit sharing ratio 50:50."},
+  {"category": "MOA / AOA", "text": "MEMORANDUM OF ASSOCIATION of ABC Private Limited. The objects for which the company is established are... ARTICLES OF ASSOCIATION. Share Capital..."},
+  {"category": "Regulatory Filing", "text": "FORM NO. MGT-7. Annual Return. Pursuant to Section 92(1) of the Companies Act, 2013. CIN: U12345TN2020PTC123456."}
+]

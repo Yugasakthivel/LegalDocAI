@@ -11,7 +11,7 @@ class Settings:
     UPLOAD_FOLDER: str = os.getenv("UPLOAD_FOLDER", "uploads")
     MAX_UPLOAD_SIZE_MB: int = int(os.getenv("MAX_UPLOAD_SIZE_MB", "10"))
     ALLOWED_EXTENSIONS: set = set(
-        os.getenv("ALLOWED_EXTENSIONS", "pdf,jpg,jpeg,png,docx,txt").split(",")
+        os.getenv("ALLOWED_EXTENSIONS", "pdf,jpg,jpeg,png,docx,txt,xls,xlsx").split(",")
     )
     
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")

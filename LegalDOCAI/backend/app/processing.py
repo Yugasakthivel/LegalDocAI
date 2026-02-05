@@ -1,12 +1,13 @@
 import io
+import os
 from typing import Tuple, List, Dict
 from PIL import Image
 import pytesseract
 import fitz  # PyMuPDF
 
-# Optional: if you set env var to point Tesseract binary, configure here:
-# import os
-# pytesseract.pytesseract.tesseract_cmd = os.getenv("TESSERACT_CMD", pytesseract.pytesseract.tesseract_cmd)
+_tess_cmd = os.getenv("TESSERACT_CMD")
+if _tess_cmd:
+    pytesseract.pytesseract.tesseract_cmd = _tess_cmd
 
 
 def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> Tuple[str, List[Image.Image]]:

@@ -96,6 +96,13 @@ ENV/
 env/
 env.bak/
 venv.bak/
+Lib/
+site-packages/
+
+# Environment variables
+.env
+.env.*
+!.env.example
 
 # Spyder project settings
 .spyderproject

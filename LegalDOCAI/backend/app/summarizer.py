@@ -1,5 +1,5 @@
 from typing import Optional
-from .config import SUMMARIZATION_MODEL
+from backend.app.core.config import SUMMARIZATION_MODEL
 import math
 
 # Try to import transformers summarization pipeline

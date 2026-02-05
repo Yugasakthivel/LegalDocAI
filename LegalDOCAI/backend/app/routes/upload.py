@@ -1,42 +1,150 @@
-from fastapi import APIRouter, UploadFile, File, HTTPException
-from backend.app import processing, vectorstore
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from fastapi.responses import JSONResponse, StreamingResponse
+from backend.app.core.config import UPLOAD_FOLDER
+from backend.app.database import documents_collection as collection
+from backend.app.services import ocr_service
+from backend.app.routes.pipeline import run_full_pipeline
+from backend.app.core.deps import get_current_user
+from bson import ObjectId
+import os
+import shutil
+import time
+import json
+import re
 
-router = APIRouter()
+router = APIRouter(tags=["upload"])
 
-@router.post("/upload/")
-async def upload_file(file: UploadFile = File(...)):
-    """
-    Upload a file, extract text (OCR/PDF/Text), embed, and store in vector DB.
-    """
-    if not file:
-        raise HTTPException(status_code=400, detail="No file sent")
+def _sse(d):
+    try: return f"data: {json.dumps(d)}\n\n"
+    except Exception: return "data: {}\n\n"
 
-    # filename fallback
-    filename: str = file.filename or "uploaded_file"
-    file_bytes = await file.read()
+@router.post("/upload")
+async def upload_file(file: UploadFile = File(...), ocr_lang: str = Form(None), ocr_engine: str = Form(None), user: dict = Depends(get_current_user)):
+    """Upload, scan, analyze, verify and save document"""
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected.")
+    
+    # 1. Save uploaded file
+    file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+    with open(file_path,"wb") as f:
+        shutil.copyfileobj(file.file,f)
 
-    # Process file -> returns dict with combined_text and OCR results
-    result: dict = processing.process_uploaded_file_bytes(file_bytes, filename)
+    # 2. Detect File Type
+    file_type = ocr_service.detect_file_type(file.filename)
+    eff_lang = ocr_service.resolve_ocr_lang_for_file(file_path, file_type, ocr_lang or "auto")
+    
+    # 3. OCR Extraction
+    try:
+        page_texts = ocr_service.extract_text_by_filetype(file_path, file_type, ocr_lang=eff_lang, ocr_engine=ocr_engine)
+    except Exception as e:
+        raise HTTPException(status_code=400,detail=f"Failed to extract text: {e}")
 
-    # Make sure combined_text is str
-    combined_text: str = str(result.get("combined_text") or "")
+    if not any(page_texts):
+        raise HTTPException(status_code=400,detail="Failed to extract text from file.")
 
-    # Prepare document for vector store
-    doc = {
-        "filename": filename,
-        "combined_text": combined_text,
-        "metadata": {"source_filename": filename},
-    }
+    full_text = "\n".join(page_texts)
 
-    # Store document
-    doc_id = vectorstore.add_document(doc)
-
-    # Safe count of OCR texts
-    ocr_texts = list(result.get("ocr_texts", []))
-
-    return {
+    # 4. Create Initial Document
+    doc_id = str(ObjectId())
+    doc_data = {
         "doc_id": doc_id,
-        "filename": filename,
-        "text_preview": combined_text[:500],
-        "ocr_texts_count": len(ocr_texts),
+        "filename": file.filename,
+        "results": [], # To be filled by pipeline
+        "analytics": {}, # To be filled by pipeline
+        "combined_text": full_text,
+        "file_type": file_type,
+        "ocr_lang": eff_lang
     }
+    collection.insert_one(doc_data)
+
+    # 5. Run Full Pipeline
+    pipeline_result = await run_full_pipeline(doc_id)
+    
+    return JSONResponse(pipeline_result)
+
+@router.post("/upload-stream")
+async def upload_stream(file: UploadFile = File(...), ocr_lang: str = Form(None), ocr_engine: str = Form(None), user: dict = Depends(get_current_user)):
+    """Upload with live server-side progress via text/event-stream"""
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected.")
+    
+    async def generate():
+        t_total_start = time.perf_counter()
+        yield _sse({"stage":"start","message":"Starting upload"})
+        file_path = os.path.join(UPLOAD_FOLDER, file.filename)
+        with open(file_path,"wb") as f:
+            shutil.copyfileobj(file.file,f)
+        
+        yield _sse({"stage":"saved"})
+        
+        file_type = ocr_service.detect_file_type(file.filename)
+        eff_lang = ocr_service.resolve_ocr_lang_for_file(file_path, file_type, ocr_lang or "auto")
+        
+        yield _sse({"stage":"lang_resolved","ocr_lang": eff_lang})
+        
+        try:
+            page_texts = ocr_service.extract_text_by_filetype(file_path, file_type, ocr_lang=eff_lang, ocr_engine=ocr_engine)
+        except Exception as e:
+            yield _sse({"stage":"error","detail": f"Failed to extract text: {e}"})
+            return
+            
+        if not any(page_texts):
+            yield _sse({"stage":"error","detail":"Failed to extract text from file."})
+            return
+            
+        yield _sse({"stage":"extracted","pages": len(page_texts)})
+        full_text = "\n".join(page_texts)
+        
+        doc_id = str(ObjectId())
+        doc_data = {
+            "doc_id": doc_id,
+            "filename": file.filename,
+            "combined_text": full_text
+        }
+        collection.insert_one(doc_data)
+        
+        yield _sse({"stage":"analyzing", "message": "Running full analysis pipeline..."})
+        
+        # Run Pipeline
+        pipeline_result = await run_full_pipeline(doc_id)
+        analytics = pipeline_result.get("analytics", {})
+        
+        yield _sse({"stage":"analyzed","legality_score":analytics.get("legality_score")})
+        yield _sse({"stage":"verified","marker":analytics.get("verified_marker"),"confidence":analytics.get("ai_confidence")})
+        yield _sse({"stage":"done","doc_id": doc_id})
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
+
+@router.post("/ocr-clean")
+async def ocr_clean(
+    file: UploadFile = File(...),
+    ocr_lang: str = Form(None),
+    ocr_engine: str = Form(None)
+):
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file selected.")
+    ext = ocr_service.detect_file_type(file.filename)
+    tmp_path = os.path.join(UPLOAD_FOLDER, f"ocrc_{file.filename}")
+    try:
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        eff_lang = ocr_service.resolve_ocr_lang_for_file(tmp_path, ext, ocr_lang or "auto")
+        if eff_lang == "tam" and not ocr_service.is_tesseract_language_available("tam"):
+            eff_lang = "eng"
+        
+        pages_structured = ocr_service.extract_text_by_filetype(tmp_path, ext, ocr_lang=eff_lang, ocr_engine=ocr_engine)
+        
+        cleaned_pages = []
+        for t in pages_structured:
+            t0 = re.sub(r"\r\n", "\n", t or "")
+            t1 = re.sub(r"[ \t]+\n", "\n", t0)
+            t2 = re.sub(r"\n{3,}", "\n\n", t1)
+            cleaned_pages.append(t2.strip())
+        combined = "\n\n---\n\n".join(cleaned_pages)
+        return {"pages": cleaned_pages, "combined_text": combined, "ocr_lang": eff_lang}
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass

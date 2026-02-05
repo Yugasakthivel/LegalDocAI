@@ -1,0 +1,2 @@
+Local ML Model not found. Please train the model first.
+Training failed: 'charmap' codec can't encode character '\U0001f504' in position 0: character maps to <undefined>

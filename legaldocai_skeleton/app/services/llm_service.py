@@ -8,17 +8,20 @@ from app.config import settings
 client = None
 if settings.OPENAI_API_KEY and not settings.OPENAI_API_KEY.startswith("sk-your"):
     try:
-        client = OpenAI(api_key=settings.OPENAI_API_KEY)
+        import httpx
+        # Explicitly create httpx client to avoid argument mismatch issues (e.g. proxies) in some versions
+        http_client = httpx.Client(trust_env=False)
+        client = OpenAI(api_key=settings.OPENAI_API_KEY, http_client=http_client)
     except Exception as e:
         print(f"Warning: Failed to initialize OpenAI client: {e}")
 
 INDIAN_LEGAL_DOCUMENT_TYPES = [
-    "Sale Deed", "Lease Deed", "Rental Agreement", "Gift Deed", 
+    "Sale Deed", "Lease Deed", "Rental Agreement", "Gift Deed",
     "Patta", "Town Survey Land Register (TSLR)", "Encumbrance Certificate",
-    "Court Judgment", "Court Order", "Legal Notice", "Affidavit",
-    "Employment Contract", "Partnership Deed", "Corporate Agreement",
+    "Court Judgment", "Court Order", "Legal Notice", "Affidavit", "Petition",
+    "Employment Contract", "Partnership Deed", "MOA / AOA", "Company Agreement", "Regulatory Filing",
     "Power of Attorney", "Will", "Trust Deed", "Mortgage Deed",
-    "Unknown Legal Document"
+    "Generic Legal Document", "Unknown Legal Document"
 ]
 
 def analyze_legal_document(text: str, document_type: str = "Unknown") -> AnalysisResult:

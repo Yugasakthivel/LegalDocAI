@@ -1,5 +1,5 @@
 # test_openai.py — Test OpenAI API Key
-from config import client, OPENAI_MODEL
+from backend.app.core.config import client, OPENAI_MODEL
 
 try:
     response = client.chat.completions.create(

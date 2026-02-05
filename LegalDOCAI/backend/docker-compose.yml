@@ -14,7 +14,7 @@ services:
     environment:
       - MONGO_URI=mongodb://mongo:27017
       - DB_NAME=legaldocai
-      - UPLOAD_DIR=/app/uploads
+      - UPLOAD_FOLDER=/app/uploads
 
   mongo:
     image: mongo:6.0

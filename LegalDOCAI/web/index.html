@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LegalDocAI</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 20px; }
+.card { border: 1px solid #ddd; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+.row { display: flex; gap: 16px; flex-wrap: wrap; }
+.col { flex: 1; min-width: 280px; }
+button { padding: 10px 16px; border: none; border-radius: 6px; background: #1f6feb; color: #fff; cursor: pointer; }
+button:disabled { background: #777; cursor: not-allowed; }
+.status { padding: 8px 12px; background: #fff3cd; border: 1px solid #ffeeba; border-radius: 6px; display: inline-block; }
+pre { background: #f6f8fa; padding: 12px; border-radius: 6px; overflow: auto; max-height: 300px; }
+</style>
+</head>
+<body>
+<h1>LegalDocAI</h1>
+<div class="card">
+  <form id="trae-form">
+    <div class="row">
+      <div class="col">
+        <label>Upload File</label><br>
+        <input type="file" name="file" accept=".pdf,.docx,.xls,.xlsx,.png,.jpg,.jpeg">
+      </div>
+      <div class="col">
+        <label>Or Paste Text</label><br>
+        <textarea name="text" rows="6" style="width:100%;"></textarea>
+      </div>
+    </div>
+    <div class="row">
+      <div class="col">
+        <label>OCR Language</label><br>
+        <select name="ocr_lang">
+          <option value="">auto</option>
+          <option value="eng">English</option>
+          <option value="tam+eng">Tamil+English</option>
+          <option value="hin+eng">Hindi+English</option>
+        </select>
+      </div>
+      <div class="col">
+        <label>OCR Engine</label><br>
+        <select name="ocr_engine">
+          <option value="">Tesseract</option>
+          <option value="easyocr">EasyOCR</option>
+        </select>
+      </div>
+    </div>
+    <br>
+    <button type="submit" id="submit-btn">Run TRAE</button>
+    <span id="status" class="status" style="display:none;">Analyzing...</span>
+  </form>
+</div>
+
+<div id="results" class="card" style="display:none;">
+  <h2>Results</h2>
+  <div class="row">
+    <div class="col">
+      <h3>Step T</h3>
+      <pre id="step-t"></pre>
+    </div>
+    <div class="col">
+      <h3>Step R</h3>
+      <pre id="step-r"></pre>
+    </div>
+  </div>
+  <div class="row">
+    <div class="col">
+      <h3>Step A</h3>
+      <pre id="step-a"></pre>
+    </div>
+    <div class="col">
+      <h3>Step E</h3>
+      <pre id="step-e"></pre>
+    </div>
+  </div>
+  <div class="row">
+    <div class="col">
+      <h3>Final Risk Score</h3>
+      <div id="final-score" class="status"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const form = document.getElementById('trae-form');
+const statusEl = document.getElementById('status');
+const btn = document.getElementById('submit-btn');
+const results = document.getElementById('results');
+const tEl = document.getElementById('step-t');
+const rEl = document.getElementById('step-r');
+const aEl = document.getElementById('step-a');
+const eEl = document.getElementById('step-e');
+const scoreEl = document.getElementById('final-score');
+let currentController = null;
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (currentController) {
+    try { currentController.abort(); } catch (_) {}
+  }
+  currentController = new AbortController();
+  const fd = new FormData(form);
+  statusEl.style.display = 'inline-block';
+  btn.disabled = true;
+  results.style.display = 'none';
+  tEl.textContent = '';
+  rEl.textContent = '';
+  aEl.textContent = '';
+  eEl.textContent = '';
+  scoreEl.textContent = '';
+  try {
+    const res = await fetch('/api/trae', { method: 'POST', body: fd, signal: currentController.signal });
+    if (!res.ok) throw new Error('Request failed');
+    const data = await res.json();
+    tEl.textContent = JSON.stringify(data.step_T, null, 2);
+    rEl.textContent = JSON.stringify(data.step_R, null, 2);
+    aEl.textContent = JSON.stringify(data.step_A, null, 2);
+    eEl.textContent = JSON.stringify(data.step_E, null, 2);
+    scoreEl.textContent = String(data.final_risk_score);
+    results.style.display = 'block';
+  } catch (err) {
+    if (err && err.name === 'AbortError') {
+      console.warn('Fetch aborted');
+    } else {
+      alert('Error: ' + err.message);
+    }
+  } finally {
+    statusEl.style.display = 'none';
+    btn.disabled = false;
+    currentController = null;
+  }
+});
+</script>
+</body>
+</html>

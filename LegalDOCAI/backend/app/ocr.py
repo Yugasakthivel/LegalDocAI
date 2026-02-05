@@ -1,8 +1,10 @@
+import os
 import pytesseract
 from pdf2image import convert_from_path
 
-# Tell pytesseract where the exe is installed
-pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+_tess_cmd = os.getenv("TESSERACT_CMD")
+if _tess_cmd:
+    pytesseract.pytesseract.tesseract_cmd = _tess_cmd
 
 def extract_text_from_file(filepath: str) -> str:
     """Extract text from a PDF file using OCR."""

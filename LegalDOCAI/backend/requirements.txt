@@ -7,3 +7,11 @@ uvicorn
 transformers
 torch
 pymongo
+pdfplumber
+openai
+python-dotenv
+httpx
+spacy
+scikit-learn
+joblib
+numpy

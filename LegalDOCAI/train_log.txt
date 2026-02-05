@@ -1,0 +1,7 @@
+Standalone Training Script Started
+Checking data file: d:\Legal-mohan\Legaldoc-new\LegalDOCAI\../legal_dataset/training_data.json
+Loaded 18 samples.
+Training now...
+Result: {'success': False, 'error': "'charmap' codec can't encode character '\\U0001f504' in position 0: character maps to <undefined>"}
+Test Prediction: Generic Legal Document (0.0)
+DONE

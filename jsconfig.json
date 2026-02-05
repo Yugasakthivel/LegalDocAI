@@ -1,0 +1,14 @@
+{
+  "compilerOptions": {
+    "checkJs": true,
+    "jsx": "react-jsx",
+    "baseUrl": "."
+  },
+  "exclude": [
+    "LegalDoc-FrontEnd/**",
+    "legaldoc-frontend/legal-doc-frontend/**",
+    "node_modules/**",
+    "**/node_modules/**"
+  ]
+}
+

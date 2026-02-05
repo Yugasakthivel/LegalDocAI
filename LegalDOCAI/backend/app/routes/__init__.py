@@ -1,15 +1,17 @@
+from . import health, upload, analysis, dataset, report, ai, document, auth, search, modules, pipeline
 from fastapi import APIRouter
-from .health import router as health_router
-from .upload import router as upload_router
-from .search import router as search_router
-from .document import router as document_router
 
-# API Router with common prefix
-router = APIRouter(prefix="/api")
+router = APIRouter()
 
-# Attach sub-routers
-router.include_router(health_router, prefix="", tags=["health"])
-router.include_router(upload_router, prefix="", tags=["upload"])
-router.include_router(search_router, prefix="", tags=["search"])
-router.include_router(search_router, prefix="", tags=["process"])
-router.include_router(document_router, prefix="", tags=["document"])
+router.include_router(health.router)
+router.include_router(auth.router)
+router.include_router(upload.router)
+router.include_router(analysis.router, prefix="/analysis")
+router.include_router(dataset.router, prefix="/dataset")
+router.include_router(report.router, prefix="/report")
+router.include_router(ai.router)
+router.include_router(document.router)
+router.include_router(search.router, prefix="/search")
+router.include_router(modules.router)
+router.include_router(pipeline.router)
+
