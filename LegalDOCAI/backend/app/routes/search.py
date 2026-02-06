@@ -2,15 +2,14 @@ from typing import List, Dict
 from fastapi import APIRouter, Query, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from backend.app.vectorstore import search, fetch_document_by_id, get_chroma_collection, embed_texts
-from backend.app.core.config import OPENAI_API_KEY
-from backend.app.core.deps import get_current_user
+from backend.app.core.deps import get_current_user, is_openai_ready
 import uuid
 
 router = APIRouter()
 
 
 def _openai_configured() -> bool:
-    return bool(OPENAI_API_KEY) and not str(OPENAI_API_KEY).startswith("sk-your")
+    return is_openai_ready()
 
 @router.get("/search/")
 def search_documents(q: str = Query(..., min_length=1), k: int = 5, user: dict = Depends(get_current_user)):

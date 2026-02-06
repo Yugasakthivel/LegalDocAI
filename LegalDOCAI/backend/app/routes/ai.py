@@ -1,9 +1,10 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from pydantic import BaseModel
 from backend.app.core.config import OPENAI_MODEL, UPLOAD_FOLDER
-from backend.app.core.deps import get_openai_client, get_current_user, update_openai_key
+from backend.app.core.deps import get_openai_client, get_current_user, update_openai_key, is_openai_ready
 from backend.app.database import documents_collection as collection
 from backend.app.services import ocr_service, analysis_service
+from backend.app.services.ml_service import classifier
 from backend.app import vectorstore
 import time
 import random
@@ -11,8 +12,25 @@ import re
 import os
 import shutil
 import uuid
+from typing import Optional
+_prefer_local_translation = os.getenv("USE_LOCAL_TRANSLATION_FIRST", "0").strip() == "1"
 
 router = APIRouter(tags=["ai"])
+
+@router.get("/openai-status")
+async def openai_status():
+    return {"ready": is_openai_ready()}
+
+@router.get("/functions")
+async def list_functions():
+    return {
+        "functions": [
+            {"name": "ai_response", "params": ["text", "question"]},
+            {"name": "chat_rag", "params": ["doc_id", "question"]},
+            {"name": "start_analysis", "params": ["email", "uploadedDocumentId"]},
+            {"name": "translate_analyze", "params": ["file", "target_lang", "ocr_lang"]}
+        ]
+    }
 
 @router.post("/update-key")
 async def update_key(key: str = Form(...), user: dict = Depends(get_current_user)):
@@ -136,6 +154,177 @@ async def chat_rag(doc_id: str, question: str, user: dict = Depends(get_current_
             answer = f"Failed to answer: {e}"
     return {"answer": answer, "sources": retrieved}
 
+@router.post("/exec")
+async def exec_function(
+    function: str = Form(...),
+    text: str = Form(None),
+    question: str = Form(None),
+    doc_id: str = Form(None),
+    email: str = Form(None),
+    uploadedDocumentId: str = Form(None),
+    user: dict = Depends(get_current_user)
+):
+    fname = (function or "").strip().lower()
+    if fname == "ai_response":
+        req = AIRequest(text=text or "", question=question)
+        return await ai_response(req, user)
+    if fname == "chat_rag":
+        if not doc_id or not question:
+            raise HTTPException(status_code=400, detail="doc_id and question are required")
+        return await chat_rag(doc_id, question, user)
+    if fname == "start_analysis":
+        req = StartRequest(email=email or "", uploadedDocumentId=uploadedDocumentId)
+        return await start_analysis(req)
+    if fname == "translate_analyze":
+        raise HTTPException(status_code=400, detail="Use /translate-analyze for file uploads")
+    raise HTTPException(status_code=400, detail="Unknown function name")
+
+@router.post("/ml/train")
+async def ml_train(
+    dataset_json: str = Form(None),
+    dataset_url: str = Form(None),
+    dataset_file: UploadFile = File(None),
+    user: dict = Depends(get_current_user)
+):
+    """
+    Train the local ML classifier with provided dataset.
+    Accepts:
+    - dataset_json: JSON string like [{"text":"...","label":"..."}]
+    - dataset_url: HTTP URL returning JSON in the same format
+    - dataset_file: uploaded file (CSV with headers text,label or JSON array)
+    """
+    samples = []
+    try:
+        if dataset_json:
+            import json
+            arr = json.loads(dataset_json)
+            if isinstance(arr, list):
+                for it in arr:
+                    t = (it or {}).get("text") or ""
+                    l = (it or {}).get("label") or ""
+                    if t and l:
+                        samples.append((t, l))
+        elif dataset_url:
+            try:
+                import httpx
+                r = httpx.get(dataset_url, timeout=10)
+                r.raise_for_status()
+                import json
+                arr = r.json()
+                if isinstance(arr, list):
+                    for it in arr:
+                        t = (it or {}).get("text") or ""
+                        l = (it or {}).get("label") or ""
+                        if t and l:
+                            samples.append((t, l))
+            except Exception:
+                pass
+        elif dataset_file:
+            name = (dataset_file.filename or "").lower()
+            buf = await dataset_file.read()
+            if name.endswith(".json"):
+                import json
+                try:
+                    arr = json.loads(buf.decode("utf-8", errors="ignore"))
+                    if isinstance(arr, list):
+                        for it in arr:
+                            t = (it or {}).get("text") or ""
+                            l = (it or {}).get("label") or ""
+                            if t and l:
+                                samples.append((t, l))
+                except Exception:
+                    pass
+            else:
+                # Treat as CSV: headers text,label
+                import csv, io
+                try:
+                    f = io.StringIO(buf.decode("utf-8", errors="ignore"))
+                    rdr = csv.DictReader(f)
+                    for row in rdr:
+                        t = (row or {}).get("text") or ""
+                        l = (row or {}).get("label") or ""
+                        if t and l:
+                            samples.append((t, l))
+                except Exception:
+                    pass
+    except Exception:
+        samples = []
+
+    texts = [t for (t, _) in samples]
+    labels = [l for (_, l) in samples]
+    res = classifier.train_model(texts, labels)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error") or "Training failed")
+    return {"status": "ok", "trained": len(texts), "details": res.get("details")}
+
+@router.post("/ml/evaluate")
+async def ml_evaluate(
+    dataset_json: str = Form(None),
+    dataset_url: str = Form(None),
+    dataset_file: UploadFile = File(None),
+    user: dict = Depends(get_current_user)
+):
+    samples = []
+    try:
+        if dataset_json:
+            import json
+            arr = json.loads(dataset_json)
+            if isinstance(arr, list):
+                for it in arr:
+                    t = (it or {}).get("text") or ""
+                    l = (it or {}).get("label") or ""
+                    if t and l:
+                        samples.append((t, l))
+        elif dataset_url:
+            try:
+                import httpx
+                r = httpx.get(dataset_url, timeout=20)
+                r.raise_for_status()
+                arr = r.json()
+                if isinstance(arr, list):
+                    for it in arr:
+                        t = (it or {}).get("text") or ""
+                        l = (it or {}).get("label") or ""
+                        if t and l:
+                            samples.append((t, l))
+            except Exception:
+                pass
+        elif dataset_file:
+            name = (dataset_file.filename or "").lower()
+            buf = await dataset_file.read()
+            if name.endswith(".json"):
+                import json
+                try:
+                    arr = json.loads(buf.decode("utf-8", errors="ignore"))
+                    if isinstance(arr, list):
+                        for it in arr:
+                            t = (it or {}).get("text") or ""
+                            l = (it or {}).get("label") or ""
+                            if t and l:
+                                samples.append((t, l))
+                except Exception:
+                    pass
+            else:
+                import csv, io
+                try:
+                    f = io.StringIO(buf.decode("utf-8", errors="ignore"))
+                    rdr = csv.DictReader(f)
+                    for row in rdr:
+                        t = (row or {}).get("text") or ""
+                        l = (row or {}).get("label") or ""
+                        if t and l:
+                            samples.append((t, l))
+                except Exception:
+                    pass
+    except Exception:
+        samples = []
+    texts = [t for (t, _) in samples]
+    labels = [l for (_, l) in samples]
+    res = classifier.evaluate_dataset(texts, labels)
+    if not res.get("success"):
+        raise HTTPException(status_code=400, detail=res.get("error") or "Evaluation failed")
+    return {"status": "ok", "evaluated": len(texts), "metrics": {"accuracy": res.get("accuracy"), "report": res.get("report"), "confusion_matrix": res.get("confusion_matrix")}}
+
 @router.post("/translate-analyze")
 async def translate_analyze(file: UploadFile = File(...), target_lang: str = Form("English"), ocr_lang: str = Form(None), user: dict = Depends(get_current_user)):
     if not file or not file.filename:
@@ -157,6 +346,48 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
     try:
         if not src_text.strip():
             translated = ""
+        elif _prefer_local_translation or not is_openai_ready():
+            def _detect_script(text: str) -> str:
+                for ch in text:
+                    o = ord(ch)
+                    if 0x0B80 <= o <= 0x0BFF:
+                        return "tam"
+                    if 0x0900 <= o <= 0x097F:
+                        return "hin"
+                return "eng"
+            def _marian_model_for(target: str, source_hint: str) -> Optional[str]:
+                t = (target or "").lower()
+                s = (source_hint or "").lower()
+                if t.startswith("english"):
+                    if "tam" in s:
+                        return "Helsinki-NLP/opus-mt-ta-en"
+                    if "hin" in s:
+                        return "Helsinki-NLP/opus-mt-hi-en"
+                return None
+            def _translate_marian(text: str, target: str, source_hint: str) -> Optional[str]:
+                model_name = _marian_model_for(target, source_hint)
+                if not model_name:
+                    auto = _detect_script(text)
+                    model_name = _marian_model_for(target, auto)
+                if not model_name:
+                    return None
+                try:
+                    from transformers import MarianMTModel, MarianTokenizer
+                except Exception:
+                    return None
+                tok = MarianTokenizer.from_pretrained(model_name)
+                mdl = MarianMTModel.from_pretrained(model_name)
+                chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+                outs = []
+                for c in chunks:
+                    enc = tok([c], return_tensors="pt", padding=True, truncation=True)
+                    gen = mdl.generate(**enc, max_length=900)
+                    outs.append(tok.decode(gen[0], skip_special_tokens=True))
+                return "\n".join(outs).strip()
+            fb = _translate_marian(src_text, target_lang, eff_lang)
+            translated = (fb or src_text)
+            if fb is None:
+                warnings.append("Local translator unavailable; showing original text.")
         else:
             prompt = (
                 f"Translate to {target_lang} preserving legal meaning and structure. "
@@ -194,17 +425,59 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
                         continue
                     raise
     except Exception as e:
-        translated = src_text
+        def _detect_script(text: str) -> str:
+            for ch in text:
+                o = ord(ch)
+                if 0x0B80 <= o <= 0x0BFF:
+                    return "tam"
+                if 0x0900 <= o <= 0x097F:
+                    return "hin"
+            return "eng"
+        def _marian_model_for(target: str, source_hint: str) -> Optional[str]:
+            t = (target or "").lower()
+            s = (source_hint or "").lower()
+            if t.startswith("english"):
+                if "tam" in s:
+                    return "Helsinki-NLP/opus-mt-ta-en"
+                if "hin" in s:
+                    return "Helsinki-NLP/opus-mt-hi-en"
+            return None
+        def _translate_marian(text: str, target: str, source_hint: str) -> Optional[str]:
+            model_name = _marian_model_for(target, source_hint)
+            if not model_name:
+                auto = _detect_script(text)
+                model_name = _marian_model_for(target, auto)
+            if not model_name:
+                return None
+            try:
+                from transformers import MarianMTModel, MarianTokenizer
+            except Exception:
+                return None
+            tok = MarianTokenizer.from_pretrained(model_name)
+            mdl = MarianMTModel.from_pretrained(model_name)
+            chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
+            outs = []
+            for c in chunks:
+                enc = tok([c], return_tensors="pt", padding=True, truncation=True)
+                gen = mdl.generate(**enc, max_length=900)
+                outs.append(tok.decode(gen[0], skip_special_tokens=True))
+            return "\n".join(outs).strip()
+        fb = None
+        try:
+            fb = _translate_marian(src_text, target_lang, eff_lang)
+        except Exception:
+            fb = None
+        translated = fb or src_text
         msg_raw = str(e)
         msg = msg_raw.lower()
         if "insufficient_quota" in msg or "you exceeded your current quota" in msg or "openai_quota_exhausted" in msg:
-            warnings.append("OpenAI quota exceeded. Showing original text.")
+            warnings.append("OpenAI quota exceeded. Using local translator if available.")
         elif "openai_not_configured" in msg or "api key" in msg or "authentication" in msg:
-            warnings.append("OpenAI API key missing or invalid. Showing original text.")
+            warnings.append("OpenAI API key missing or invalid. Using local translator if available.")
         elif "timed out" in msg or "timeout" in msg:
-            warnings.append("Translation timed out. Showing original text.")
+            warnings.append("Translation timed out. Using local translator if available.")
         else:
-            warnings.append(f"Translation failed: {str(e)}. Showing original text.")
+            warnings.append(f"Translation failed: {str(e)}. Using local translator if available.")
     finally:
         try:
             os.remove(path)

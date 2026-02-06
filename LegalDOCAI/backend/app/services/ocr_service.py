@@ -3,26 +3,59 @@ import re
 import shutil
 import fitz  # PyMuPDF
 from PIL import Image, ImageEnhance, ImageFilter
-import pytesseract
+
 import concurrent.futures
 from typing import List, Optional
 from fastapi import HTTPException
 from backend.app.core.config import TESSERACT_CMD
+_pt = None
+def _get_pytesseract():
+    global _pt
+    if _pt is None:
+        try:
+            import pytesseract as _p
+            try:
+                if TESSERACT_CMD:
+                    _p.pytesseract.tesseract_cmd = TESSERACT_CMD
+            except Exception:
+                pass
+            _pt = _p
+        except Exception:
+            _pt = None
+    return _pt
 
-try:
-    import easyocr
-except ImportError:
-    easyocr = None
+_easyocr = None
+def _get_easyocr():
+    global _easyocr
+    if _easyocr is None:
+        try:
+            import easyocr as _e
+            _easyocr = _e
+        except Exception:
+            _easyocr = None
+    return _easyocr
 
-try:
-    from docx import Document
-except ImportError:
-    Document = None
+_docx_Document = None
+def _get_docx_document():
+    global _docx_Document
+    if _docx_Document is None:
+        try:
+            from docx import Document as _D
+            _docx_Document = _D
+        except Exception:
+            _docx_Document = None
+    return _docx_Document
 
-try:
-    import pandas as pd
-except ImportError:
-    pd = None
+_pandas = None
+def _get_pandas():
+    global _pandas
+    if _pandas is None:
+        try:
+            import pandas as _pd
+            _pandas = _pd
+        except Exception:
+            _pandas = None
+    return _pandas
 
 OCR_DPI_DEFAULT = 300
 
@@ -77,12 +110,18 @@ def detect_language_simple(text: str) -> str:
 
 def is_tesseract_language_available(lang: str) -> bool:
     try:
-        langs = pytesseract.get_languages(config="")
+        pt = _get_pytesseract()
+        if not pt:
+            return False
+        langs = pt.get_languages(config="")
         return lang in (langs or [])
     except Exception:
         try:
+            pt = _get_pytesseract()
+            if not pt:
+                return False
             img = Image.new("RGB", (16, 16), (255, 255, 255))
-            _ = pytesseract.image_to_string(img, lang=lang)
+            _ = pt.image_to_string(img, lang=lang)
             return True
         except Exception:
             return False
@@ -138,32 +177,51 @@ def extract_text_from_pdf(file_path: str, ocr_lang: str = None, dpi: int = OCR_D
         # Preprocess image for better OCR
         img = preprocess_image(img)
         
-        if ocr_engine and ocr_engine.lower() == "easyocr" and easyocr:
+        ec = _get_easyocr()
+        if ocr_engine and ocr_engine.lower() == "easyocr" and ec:
             try:
                 langs = []
                 if ocr_lang:
                     if "tam" in ocr_lang: langs.append("ta")
                     if "hin" in ocr_lang: langs.append("hi")
                 if not langs: langs = ["en"]
-                reader = easyocr.Reader(langs, gpu=False)
+                reader = ec.Reader(langs, gpu=False)
                 res = reader.readtext(img, detail=0)
                 return "\n".join(res)
             except Exception: pass
         try:
-            base = pytesseract.image_to_string(img, lang=ocr_lang) if ocr_lang else pytesseract.image_to_string(img)
+            pt = _get_pytesseract()
+            if not pt:
+                raise RuntimeError("pytesseract not available")
+            base = pt.image_to_string(img, lang=ocr_lang) if ocr_lang else pt.image_to_string(img)
             if (len(base.strip()) < 10) or ("tam" in (ocr_lang or "")) and not any(0x0B80 <= ord(c) <= 0x0BFF for c in base):
                 best = base
                 for deg in (90, 180, 270):
                     try:
                         rot = img.rotate(deg, expand=True)
-                        txt = pytesseract.image_to_string(rot, lang=ocr_lang) if ocr_lang else pytesseract.image_to_string(rot)
+                        txt = pt.image_to_string(rot, lang=ocr_lang) if ocr_lang else pt.image_to_string(rot)
                         if len(txt.strip()) > len(best.strip()): best = txt
                     except Exception: continue
                 return best
             return base
         except Exception:
-            try: return pytesseract.image_to_string(img)
-            except Exception: return ""
+            try:
+                pt = _get_pytesseract()
+                if pt:
+                    return pt.image_to_string(img)
+                ec = _get_easyocr()
+                if ec:
+                    langs = []
+                    if ocr_lang:
+                        if "tam" in ocr_lang: langs.append("ta")
+                        if "hin" in ocr_lang: langs.append("hi")
+                    if not langs: langs = ["en"]
+                    reader = ec.Reader(langs, gpu=False)
+                    res = reader.readtext(img, detail=0)
+                    return "\n".join(res)
+                return ""
+            except Exception:
+                return ""
 
     if to_ocr:
         workers = max(1, min(4, len(to_ocr)))
@@ -180,39 +238,60 @@ def extract_text_from_image(file_path: str, ocr_lang: str = None, ocr_engine: st
     # Preprocess for better OCR
     image = preprocess_image(image)
     
-    if ocr_engine and ocr_engine.lower() == "easyocr" and easyocr:
+    ec = _get_easyocr()
+    if ocr_engine and ocr_engine.lower() == "easyocr" and ec:
         try:
             langs = []
             if ocr_lang:
                 if "tam" in ocr_lang: langs.append("ta")
                 if "hin" in ocr_lang: langs.append("hi")
             if not langs: langs = ["en"]
-            reader = easyocr.Reader(langs, gpu=False)
+            reader = ec.Reader(langs, gpu=False)
             res = reader.readtext(image, detail=0)
             return ["\n".join(res)]
         except Exception: pass
     try:
-        base = pytesseract.image_to_string(image, lang=ocr_lang) if ocr_lang else pytesseract.image_to_string(image)
+        pt = _get_pytesseract()
+        if not pt:
+            raise RuntimeError("pytesseract not available")
+        base = pt.image_to_string(image, lang=ocr_lang) if ocr_lang else pt.image_to_string(image)
         if (len(base.strip()) < 10) or ("tam" in (ocr_lang or "")) and not any(0x0B80 <= ord(c) <= 0x0BFF for c in base):
             best = base
             for deg in (90, 180, 270):
                 try:
                     rot = image.rotate(deg, expand=True)
-                    txt = pytesseract.image_to_string(rot, lang=ocr_lang) if ocr_lang else pytesseract.image_to_string(rot)
+                    txt = pt.image_to_string(rot, lang=ocr_lang) if ocr_lang else pt.image_to_string(rot)
                     if len(txt.strip()) > len(best.strip()): best = txt
                 except Exception: continue
             return [best]
         return [base]
     except Exception:
-        try: return [pytesseract.image_to_string(image)]
-        except Exception: return [""]
+        try:
+            pt = _get_pytesseract()
+            if pt:
+                return [pt.image_to_string(image)]
+            ec = _get_easyocr()
+            if ec:
+                langs = []
+                if ocr_lang:
+                    if "tam" in ocr_lang: langs.append("ta")
+                    if "hin" in ocr_lang: langs.append("hi")
+                if not langs: langs = ["en"]
+                reader = ec.Reader(langs, gpu=False)
+                res = reader.readtext(image, detail=0)
+                return ["\n".join(res)]
+            return [""]
+        except Exception:
+            return [""]
 
 def extract_text_from_word(file_path: str) -> List[str]:
-    if not Document: return [""]
-    doc = Document(file_path)
+    D = _get_docx_document()
+    if not D: return [""]
+    doc = D(file_path)
     return [para.text for para in doc.paragraphs if para.text.strip()]
 
 def extract_text_from_excel(file_path: str) -> List[str]:
+    pd = _get_pandas()
     if not pd: return [""]
     df = pd.read_excel(file_path)
     return [df.to_string()]

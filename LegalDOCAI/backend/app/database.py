@@ -135,15 +135,25 @@ class LocalCollection:
     def create_index(self, *args, **kwargs):
         return None
 
-try:
-    client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
-    client.server_info()
-    db = client[DB_NAME]
-    documents_collection = db["documents"]
-    users_collection = db["users"]
-    documents_collection.create_index([("doc_id", ASCENDING)], unique=True)
-except Exception:
+_disable_mongo = os.getenv("DISABLE_MONGO", "1").strip() == "1"
+if _disable_mongo:
     client = None
     db = None
     documents_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_documents.json"))
     users_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_users.json"))
+else:
+    try:
+        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
+        client.admin.command("ping")
+        db = client[DB_NAME]
+        documents_collection = db["documents"]
+        users_collection = db["users"]
+        try:
+            documents_collection.create_index([("doc_id", ASCENDING)], unique=True)
+        except Exception:
+            pass
+    except Exception:
+        client = None
+        db = None
+        documents_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_documents.json"))
+        users_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_users.json"))

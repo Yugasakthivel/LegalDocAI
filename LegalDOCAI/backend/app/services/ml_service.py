@@ -4,6 +4,7 @@ import numpy as np
 import re
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import SGDClassifier
+7→from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from typing import Dict, Any, List, Tuple
 
 # Constants
@@ -79,6 +80,21 @@ class DocumentClassifier:
             print(f"Prediction error: {e}")
             return "Generic Legal Document", 0.0
 
+82→    def evaluate_dataset(self, texts: List[str], labels: List[str]) -> Dict[str, Any]:
+83→        try:
+84→            if not self.is_loaded:
+85→                return {"success": False, "error": "Model not loaded"}
+86→            if not texts or not labels:
+87→                return {"success": False, "error": "No evaluation data provided"}
+88→            X = self.vectorizer.transform(texts)
+89→            preds = self.model.predict(X)
+90→            acc = float(accuracy_score(labels, preds))
+91→            report = classification_report(labels, preds, output_dict=True, zero_division=0)
+92→            cm = confusion_matrix(labels, preds).tolist()
+93→            return {"success": True, "accuracy": acc, "report": report, "confusion_matrix": cm}
+94→        except Exception as e:
+95→            return {"success": False, "error": str(e)}
+96→
     def verify_document_ml(self, text: str) -> Dict[str, Any]:
         """
         Verify document legitimacy using ML confidence and heuristic rules.

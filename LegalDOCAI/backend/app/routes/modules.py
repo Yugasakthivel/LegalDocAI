@@ -11,8 +11,8 @@ from backend.app.services.compliance_service import jurisdiction_checks, curated
 from backend.app.services.verification_service import verify_document, validate_signers
 from backend.app.services.storage_service import create_initial_document, get_document, save_document
 from backend.app.vectorstore import add_document, fetch_document_by_id, search as rag_search
-from backend.app.core.config import UPLOAD_FOLDER, OPENAI_API_KEY
-from backend.app.core.deps import get_current_user
+from backend.app.core.config import UPLOAD_FOLDER
+from backend.app.core.deps import get_current_user, is_openai_ready
 
 # Optional deps for Module 1 forensic checks
 try:
@@ -33,7 +33,7 @@ router = APIRouter(prefix="/modules", tags=["modules"])
 
 
 def _openai_configured() -> bool:
-    return bool(OPENAI_API_KEY) and not str(OPENAI_API_KEY).startswith("sk-your")
+    return is_openai_ready()
 
 # Helper to persist incremental pipeline status
 

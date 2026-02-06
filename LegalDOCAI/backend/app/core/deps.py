@@ -1,4 +1,4 @@
-from backend.app.core.config import SECRET_KEY, ALGORITHM
+from backend.app.core.config import SECRET_KEY, ALGORITHM, OPENAI_API_KEY
 import httpx
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -9,6 +9,9 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 _client = None
 _quota_exhausted = False
+
+def is_openai_ready() -> bool:
+    return _client is not None
 
 def get_openai_client():
     global _client
@@ -49,4 +52,17 @@ def update_openai_key(new_key: str):
         return True
     except Exception as e:
         print(f"Error updating OpenAI key: {e}")
+        return False
+
+def init_openai_from_env():
+    global _client, _quota_exhausted
+    try:
+        if OPENAI_API_KEY:
+            from openai import OpenAI
+            _client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False))
+            _quota_exhausted = False
+            return True
+        return False
+    except Exception as e:
+        print(f"Error initializing OpenAI from env: {e}")
         return False

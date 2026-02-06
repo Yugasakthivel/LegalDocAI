@@ -10,9 +10,7 @@ from backend.app.routes import router as backend_api_router
 from backend.app.core.config import (
     OPENAI_MODEL, MONGO_URI, DB_NAME, TESSERACT_CMD, UPLOAD_FOLDER
 )
-from backend.app.core.deps import get_openai_client
-from backend.app.database import documents_collection as collection
-from backend.app.services import ocr_service, analysis_service
+from backend.app.core.deps import get_openai_client, init_openai_from_env
 from backend.app.services.risk_service import compute_combined_risk_index
 from backend.app.services.verification_service import verify_document, validate_signers
 from backend.app.services.compliance_service import jurisdiction_checks, curated_checks
@@ -25,6 +23,7 @@ import json
 @asynccontextmanager
 async def lifespan(app):
     # Startup
+    init_openai_from_env()
     print("===============================================")
     print("LegalDocAI Backend Started")
     print(f"Model: {OPENAI_MODEL}")
@@ -111,5 +110,8 @@ except Exception as e:
 
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn, os
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
+    uvicorn.run("main:app", host=host, port=port, reload=reload_flag)
