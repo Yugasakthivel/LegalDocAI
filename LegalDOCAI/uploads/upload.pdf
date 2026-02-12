@@ -1,9 +1,0 @@
-{
-  "results": [...],
-  "analytics": {
-    "summary": "text...",
-    "legality_score": 85,
-    ...
-  },
-  "fileName": "sample.pdf"
-}

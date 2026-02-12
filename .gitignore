@@ -121,6 +121,17 @@ site-packages/
 .DS_Store
 Thumbs.db
 
+# Runtime / local generated artifacts
+/uploads/
+/chroma/
+/local_db_documents.json
+/local_db_users.json
+
+# Backend runtime artifacts
+/LegalDOCAI/uploads/
+/LegalDOCAI/chroma/
+/LegalDOCAI/node_modules/
+
 # mypy
 .mypy_cache/
 
