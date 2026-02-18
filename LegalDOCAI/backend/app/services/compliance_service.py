@@ -1,5 +1,6 @@
 import re
 import json
+import asyncio
 from typing import Dict, Any, List
 from backend.app.services.nlp_service import _get_nlp
 
@@ -49,8 +50,14 @@ def jurisdiction_checks(full_text: str) -> Dict[str, Any]:
         "overall_compliance_score": score
     }
 
+async def jurisdiction_checks_async(full_text: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(jurisdiction_checks, full_text)
+
 def curated_checks(full_text: str) -> Dict[str, Any]:
     return jurisdiction_checks(full_text)
+
+async def curated_checks_async(full_text: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(curated_checks, full_text)
 
 def mandatory_fields(full_text: str) -> Dict[str, Any]:
     # Regex-based extraction helper
@@ -98,3 +105,6 @@ def mandatory_fields(full_text: str) -> Dict[str, Any]:
         "parties": parties,
         "missing_fields": missing_fields
     }
+
+async def mandatory_fields_async(full_text: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(mandatory_fields, full_text)

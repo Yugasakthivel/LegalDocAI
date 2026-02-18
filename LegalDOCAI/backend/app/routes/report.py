@@ -4,7 +4,10 @@ from backend.app.database import documents_collection as collection
 from backend.app.core.deps import get_openai_client
 from backend.app.core.config import OPENAI_MODEL
 import json
-import fitz
+try:
+    import fitz
+except Exception:
+    fitz = None
 
 router = APIRouter(tags=["report"])
 
@@ -109,6 +112,8 @@ async def report_html(doc_id: str, law: str = None):
 
 @router.get("/pdf")
 async def report_pdf(doc_id: str):
+    if not fitz:
+        raise HTTPException(status_code=503, detail="PDF generation unavailable (PyMuPDF not installed)")
     d = collection.find_one({"doc_id": doc_id}, {"_id": 0})
     if not d:
         raise HTTPException(status_code=404, detail="Document not found.")

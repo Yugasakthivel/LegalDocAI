@@ -1,4 +1,5 @@
 import json
+import asyncio
 from typing import Dict, Any
 from backend.app.services.analysis_service import clause_risk_detection as regex_risk_detection
 
@@ -7,6 +8,9 @@ def clause_risk_detection(full_text: str) -> Dict[str, Any]:
     Delegate to the rule-based implementation in analysis_service.
     """
     return regex_risk_detection(full_text)
+
+async def clause_risk_detection_async(full_text: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(clause_risk_detection, full_text)
 
 def compute_combined_risk_index(analytics: Dict[str, Any]) -> int:
     ls = float(analytics.get("legality_score") or 0)

@@ -4,6 +4,7 @@ from backend.app.database import users_collection
 from backend.app.core.security import verify_password, get_password_hash, create_access_token
 from backend.app.core.config import ACCESS_TOKEN_EXPIRE_MINUTES
 from datetime import timedelta
+import re
 import uuid
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -27,13 +28,21 @@ async def register(user: UserCreate):
     try:
         if users_collection.find_one({"email": user.email}):
             raise HTTPException(status_code=400, detail="Email already registered")
-        if users_collection.find_one({"username": user.username}):
+        username = (user.username or "").strip()
+        if not username:
+            base = re.sub(r"[^a-zA-Z0-9_]+", "", (user.email or "").split("@")[0]) or "user"
+            username = base
+            suffix = 1
+            while users_collection.find_one({"username": username}):
+                username = f"{base}{suffix}"
+                suffix += 1
+        elif users_collection.find_one({"username": username}):
             raise HTTPException(status_code=400, detail="Username already taken")
         hashed_password = get_password_hash(user.password)
         user_id = str(uuid.uuid4())
         user_dict = {
             "user_id": user_id,
-            "username": user.username,
+            "username": username,
             "email": user.email,
             "password": hashed_password,
             "is_verified": False
@@ -43,7 +52,7 @@ async def register(user: UserCreate):
         access_token = create_access_token(
             data={"sub": user.email, "user_id": user_id}, expires_delta=access_token_expires
         )
-        return {"access_token": access_token, "token_type": "bearer", "username": user.username}
+        return {"access_token": access_token, "token_type": "bearer", "username": username}
     except HTTPException:
         raise
     except Exception as e:

@@ -132,6 +132,24 @@ class LocalCollection:
         class R:
             modified_count = modified
         return R()
+    def delete_one(self, filter):
+        data = self._load()
+        deleted = 0
+        for i, d in enumerate(data):
+            ok = True
+            for k, v in filter.items():
+                if d.get(k) != v:
+                    ok = False
+                    break
+            if ok:
+                del data[i]
+                deleted = 1
+                break
+        if deleted:
+            self._save(data)
+        class R:
+            deleted_count = deleted
+        return R()
     def create_index(self, *args, **kwargs):
         return None
 

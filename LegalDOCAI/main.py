@@ -35,17 +35,33 @@ async def lifespan(app):
     if not classifier.is_loaded:
         print("ML Model not found. Attempting to auto-train...")
         try:
-            # Path to training data relative to main.py
-            # LegalDOCAI/main.py -> ../legal_dataset/training_data.json
             base_dir = os.path.dirname(os.path.abspath(__file__))
-            data_path = os.path.abspath(os.path.join(base_dir, "..", "legal_dataset", "training_data.json"))
-            
-            if os.path.exists(data_path):
-                with open(data_path, "r", encoding="utf-8") as f:
+            # Prefer last uploaded dataset if present
+            last_dataset_file = os.path.abspath(os.path.join(base_dir, "data", "datasets", "last_dataset_path.txt"))
+            dataset_path = None
+            if os.path.exists(last_dataset_file):
+                try:
+                    with open(last_dataset_file, "r", encoding="utf-8") as f:
+                        candidate = (f.read() or "").strip()
+                    if candidate and os.path.exists(candidate):
+                        dataset_path = candidate
+                except Exception:
+                    dataset_path = None
+
+            # Fallback to repo default dataset
+            if not dataset_path:
+                dataset_path = os.path.abspath(os.path.join(base_dir, "..", "legal_dataset", "training_data.json"))
+
+            if os.path.exists(dataset_path):
+                with open(dataset_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
-                texts = [d["text"] for d in data]
-                labels = [d["category"] for d in data]
-                
+                # Accept either {text,label} or {text,category}
+                texts = [d.get("text") for d in data if isinstance(d, dict)]
+                labels = [d.get("label") or d.get("category") for d in data if isinstance(d, dict)]
+                pairs = [(t, l) for t, l in zip(texts, labels) if t and l]
+                texts = [t for t, _ in pairs]
+                labels = [l for _, l in pairs]
+
                 print(f"Found {len(texts)} training samples. Training now...")
                 result = classifier.train_model(texts, labels)
                 if result.get("success"):
@@ -53,7 +69,7 @@ async def lifespan(app):
                 else:
                     print(f"Auto-training failed: {result.get('error')}")
             else:
-                print(f"Training data not found at {data_path}")
+                print(f"Training data not found at {dataset_path}")
         except Exception as e:
             print(f"Error during auto-training: {e}")
     else:
@@ -88,21 +104,19 @@ try:
 except Exception:
     pass
 
-# Mount skeleton app (legaldocai_skeleton) under /skeleton
 try:
-    import sys
-    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-    if base_dir not in sys.path:
-        sys.path.append(base_dir)
-        
-    # Add legaldocai_skeleton to sys.path so 'import app' works within it
-    skeleton_dir = os.path.join(base_dir, "legaldocai_skeleton")
-    if skeleton_dir not in sys.path:
-        sys.path.append(skeleton_dir)
-
-    from legaldocai_skeleton.app.main import app as skeleton_app
-    app.mount("/skeleton", skeleton_app)
-    print("Mounted legaldocai_skeleton at /skeleton")
+    enable_skeleton = os.getenv("MOUNT_SKELETON", "false").lower() == "true"
+    if enable_skeleton:
+        import sys
+        base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if base_dir not in sys.path:
+            sys.path.append(base_dir)
+        skeleton_dir = os.path.join(base_dir, "legaldocai_skeleton")
+        if skeleton_dir not in sys.path:
+            sys.path.append(skeleton_dir)
+        from legaldocai_skeleton.app.main import app as skeleton_app
+        app.mount("/skeleton", skeleton_app)
+        print("Mounted legaldocai_skeleton at /skeleton")
 except Exception as e:
     print(f"Failed to mount legaldocai_skeleton: {e}")
 
@@ -114,4 +128,4 @@ if __name__ == "__main__":
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
-    uvicorn.run("main:app", host=host, port=port, reload=reload_flag)
+    uvicorn.run(app, host=host, port=port, reload=reload_flag)

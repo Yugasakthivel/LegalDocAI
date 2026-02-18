@@ -8,16 +8,27 @@ from backend.app.database import users_collection
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")
 
 _client = None
+_async_client = None
 _quota_exhausted = False
 
 def is_openai_ready() -> bool:
-    return _client is not None
+    return _client is not None and not _quota_exhausted
 
 def get_openai_client():
-    global _client
+    global _client, _quota_exhausted
     if _client is None:
         raise RuntimeError("OpenAI client not initialized. Please update the API key.")
+    if _quota_exhausted:
+         raise RuntimeError("OpenAI quota exhausted. Using fallbacks.")
     return _client
+
+def get_async_openai_client():
+    global _async_client, _quota_exhausted
+    if _async_client is None:
+        raise RuntimeError("Async OpenAI client not initialized.")
+    if _quota_exhausted:
+         raise RuntimeError("OpenAI quota exhausted. Using fallbacks.")
+    return _async_client
 
 async def get_current_user(token: str = Depends(oauth2_scheme)):
     credentials_exception = HTTPException(
@@ -43,11 +54,12 @@ def mark_quota_exhausted():
     _quota_exhausted = True
 
 def update_openai_key(new_key: str):
-    global _client, _quota_exhausted
+    global _client, _async_client, _quota_exhausted
     import httpx
     try:
-        from openai import OpenAI
+        from openai import OpenAI, AsyncOpenAI
         _client = OpenAI(api_key=new_key, http_client=httpx.Client(trust_env=False))
+        _async_client = AsyncOpenAI(api_key=new_key, http_client=httpx.AsyncClient(trust_env=False))
         _quota_exhausted = False
         return True
     except Exception as e:
@@ -55,11 +67,12 @@ def update_openai_key(new_key: str):
         return False
 
 def init_openai_from_env():
-    global _client, _quota_exhausted
+    global _client, _async_client, _quota_exhausted
     try:
         if OPENAI_API_KEY:
-            from openai import OpenAI
+            from openai import OpenAI, AsyncOpenAI
             _client = OpenAI(api_key=OPENAI_API_KEY, http_client=httpx.Client(trust_env=False))
+            _async_client = AsyncOpenAI(api_key=OPENAI_API_KEY, http_client=httpx.AsyncClient(trust_env=False))
             _quota_exhausted = False
             return True
         return False

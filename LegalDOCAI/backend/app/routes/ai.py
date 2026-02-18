@@ -1,9 +1,10 @@
 from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from pydantic import BaseModel
 from backend.app.core.config import OPENAI_MODEL, UPLOAD_FOLDER
-from backend.app.core.deps import get_openai_client, get_current_user, update_openai_key, is_openai_ready
+from backend.app.core.deps import get_openai_client, get_async_openai_client, get_current_user, update_openai_key, is_openai_ready
 from backend.app.database import documents_collection as collection
-from backend.app.services import ocr_service, analysis_service
+from backend.app.services import ocr_service, analysis_service, verification_service
+from backend.app.services.risk_service import compute_combined_risk_index
 from backend.app.services.ml_service import classifier
 from backend.app import vectorstore
 import time
@@ -12,6 +13,7 @@ import re
 import os
 import shutil
 import uuid
+import asyncio
 from typing import Optional
 _prefer_local_translation = os.getenv("USE_LOCAL_TRANSLATION_FIRST", "0").strip() == "1"
 
@@ -28,8 +30,16 @@ async def list_functions():
             {"name": "ai_response", "params": ["text", "question"]},
             {"name": "chat_rag", "params": ["doc_id", "question"]},
             {"name": "start_analysis", "params": ["email", "uploadedDocumentId"]},
-            {"name": "translate_analyze", "params": ["file", "target_lang", "ocr_lang"]}
+            {"name": "translate_analyze", "params": ["file", "target_lang", "ocr_lang", "engine"]},
+            {"name": "document_types", "params": []}
         ]
+    }
+
+@router.get("/document-types")
+async def document_types(user: dict = Depends(get_current_user)):
+    return {
+        "count": len(classifier.get_supported_document_types()),
+        "document_types": classifier.get_supported_document_types()
     }
 
 @router.post("/update-key")
@@ -88,7 +98,10 @@ async def ai_response(req: AIRequest, user: dict = Depends(get_current_user)):
                 break
             except Exception as e:
                 sc = getattr(e, "status_code", None)
-                if sc == 429 or "429" in str(e):
+                msg = str(e).lower()
+                if sc == 429 or "429" in msg or "insufficient_quota" in msg or "exceeded your current quota" in msg:
+                    from backend.app.core.deps import mark_quota_exhausted
+                    mark_quota_exhausted()
                     if attempt >= 4:
                         raise
                     ra = _parse_retry_after_seconds(str(e))
@@ -122,14 +135,10 @@ async def chat_rag(doc_id: str, question: str, user: dict = Depends(get_current_
     if doc.get("combined_text"):
         vectorstore.add_document({"doc_id": doc_id, "filename": doc.get("filename",""), "combined_text": doc["combined_text"]})
         
-    retrieved = vectorstore.search(question, top_k=3)
+    retrieved = vectorstore.search_doc_first(question, doc_id, top_k=3)
     contexts = []
-    for r in retrieved:
-        # If vectorstore returns doc_ids from other docs, filter or use?
-        # main.py logic seems to assume search index contains *all* docs.
-        # But if we want RAG over *this* doc, we should filter.
-        # However, main.py search_index searched ALL docs.
-        d_res = collection.find_one({"doc_id": r["doc_id"]}, {"_id": 0, "combined_text": 1})
+    for r in (retrieved or []):
+        d_res = collection.find_one({"doc_id": r.get("doc_id")}, {"_id": 0, "combined_text": 1})
         if d_res and d_res.get("combined_text"):
             contexts.append(d_res["combined_text"][:2000])
             
@@ -152,7 +161,7 @@ async def chat_rag(doc_id: str, question: str, user: dict = Depends(get_current_
             answer = analysis_service.answer_with_fallback(question, context_blob)
         except Exception:
             answer = f"Failed to answer: {e}"
-    return {"answer": answer, "sources": retrieved}
+    return {"answer": answer, "sources": retrieved or []}
 
 @router.post("/exec")
 async def exec_function(
@@ -177,176 +186,44 @@ async def exec_function(
         return await start_analysis(req)
     if fname == "translate_analyze":
         raise HTTPException(status_code=400, detail="Use /translate-analyze for file uploads")
+    if fname == "document_types":
+        return await document_types(user)
     raise HTTPException(status_code=400, detail="Unknown function name")
 
-@router.post("/ml/train")
-async def ml_train(
-    dataset_json: str = Form(None),
-    dataset_url: str = Form(None),
-    dataset_file: UploadFile = File(None),
-    user: dict = Depends(get_current_user)
-):
-    """
-    Train the local ML classifier with provided dataset.
-    Accepts:
-    - dataset_json: JSON string like [{"text":"...","label":"..."}]
-    - dataset_url: HTTP URL returning JSON in the same format
-    - dataset_file: uploaded file (CSV with headers text,label or JSON array)
-    """
-    samples = []
-    try:
-        if dataset_json:
-            import json
-            arr = json.loads(dataset_json)
-            if isinstance(arr, list):
-                for it in arr:
-                    t = (it or {}).get("text") or ""
-                    l = (it or {}).get("label") or ""
-                    if t and l:
-                        samples.append((t, l))
-        elif dataset_url:
-            try:
-                import httpx
-                r = httpx.get(dataset_url, timeout=10)
-                r.raise_for_status()
-                import json
-                arr = r.json()
-                if isinstance(arr, list):
-                    for it in arr:
-                        t = (it or {}).get("text") or ""
-                        l = (it or {}).get("label") or ""
-                        if t and l:
-                            samples.append((t, l))
-            except Exception:
-                pass
-        elif dataset_file:
-            name = (dataset_file.filename or "").lower()
-            buf = await dataset_file.read()
-            if name.endswith(".json"):
-                import json
-                try:
-                    arr = json.loads(buf.decode("utf-8", errors="ignore"))
-                    if isinstance(arr, list):
-                        for it in arr:
-                            t = (it or {}).get("text") or ""
-                            l = (it or {}).get("label") or ""
-                            if t and l:
-                                samples.append((t, l))
-                except Exception:
-                    pass
-            else:
-                # Treat as CSV: headers text,label
-                import csv, io
-                try:
-                    f = io.StringIO(buf.decode("utf-8", errors="ignore"))
-                    rdr = csv.DictReader(f)
-                    for row in rdr:
-                        t = (row or {}).get("text") or ""
-                        l = (row or {}).get("label") or ""
-                        if t and l:
-                            samples.append((t, l))
-                except Exception:
-                    pass
-    except Exception:
-        samples = []
-
-    texts = [t for (t, _) in samples]
-    labels = [l for (_, l) in samples]
-    res = classifier.train_model(texts, labels)
-    if not res.get("success"):
-        raise HTTPException(status_code=400, detail=res.get("error") or "Training failed")
-    return {"status": "ok", "trained": len(texts), "details": res.get("details")}
-
-@router.post("/ml/evaluate")
-async def ml_evaluate(
-    dataset_json: str = Form(None),
-    dataset_url: str = Form(None),
-    dataset_file: UploadFile = File(None),
-    user: dict = Depends(get_current_user)
-):
-    samples = []
-    try:
-        if dataset_json:
-            import json
-            arr = json.loads(dataset_json)
-            if isinstance(arr, list):
-                for it in arr:
-                    t = (it or {}).get("text") or ""
-                    l = (it or {}).get("label") or ""
-                    if t and l:
-                        samples.append((t, l))
-        elif dataset_url:
-            try:
-                import httpx
-                r = httpx.get(dataset_url, timeout=20)
-                r.raise_for_status()
-                arr = r.json()
-                if isinstance(arr, list):
-                    for it in arr:
-                        t = (it or {}).get("text") or ""
-                        l = (it or {}).get("label") or ""
-                        if t and l:
-                            samples.append((t, l))
-            except Exception:
-                pass
-        elif dataset_file:
-            name = (dataset_file.filename or "").lower()
-            buf = await dataset_file.read()
-            if name.endswith(".json"):
-                import json
-                try:
-                    arr = json.loads(buf.decode("utf-8", errors="ignore"))
-                    if isinstance(arr, list):
-                        for it in arr:
-                            t = (it or {}).get("text") or ""
-                            l = (it or {}).get("label") or ""
-                            if t and l:
-                                samples.append((t, l))
-                except Exception:
-                    pass
-            else:
-                import csv, io
-                try:
-                    f = io.StringIO(buf.decode("utf-8", errors="ignore"))
-                    rdr = csv.DictReader(f)
-                    for row in rdr:
-                        t = (row or {}).get("text") or ""
-                        l = (row or {}).get("label") or ""
-                        if t and l:
-                            samples.append((t, l))
-                except Exception:
-                    pass
-    except Exception:
-        samples = []
-    texts = [t for (t, _) in samples]
-    labels = [l for (_, l) in samples]
-    res = classifier.evaluate_dataset(texts, labels)
-    if not res.get("success"):
-        raise HTTPException(status_code=400, detail=res.get("error") or "Evaluation failed")
-    return {"status": "ok", "evaluated": len(texts), "metrics": {"accuracy": res.get("accuracy"), "report": res.get("report"), "confusion_matrix": res.get("confusion_matrix")}}
+ 
 
 @router.post("/translate-analyze")
-async def translate_analyze(file: UploadFile = File(...), target_lang: str = Form("English"), ocr_lang: str = Form(None), user: dict = Depends(get_current_user)):
-    if not file or not file.filename:
-        raise HTTPException(status_code=400, detail="No file selected.")
-    path = os.path.join(UPLOAD_FOLDER, f"trans_{uuid.uuid4()}_{file.filename}")
-    with open(path, "wb") as f:
-        shutil.copyfileobj(file.file, f)
-    ext = ocr_service.detect_file_type(file.filename)
-    warnings = []
-    eff_lang = ocr_service.resolve_ocr_lang_for_file(path, ext, ocr_lang or "auto")
-    if eff_lang == "tam" and not ocr_service.is_tesseract_language_available("tam"):
-        warnings.append("Tamil OCR not installed; using English OCR.")
-        eff_lang = "eng"
-    pages = ocr_service.extract_text_by_filetype(path, ext, ocr_lang=eff_lang)
-    src_text = "\n".join(pages)
-    if not src_text.strip():
-        warnings.append("OCR could not extract any text from the document.")
-
+async def translate_analyze(
+    file: UploadFile = File(...),
+    target_lang: str = Form("English"),
+    ocr_lang: str = Form(None),
+    engine: str = Form("auto"),
+    user: dict = Depends(get_current_user)
+):
+    path = None
     try:
+        if not file or not file.filename:
+            raise HTTPException(status_code=400, detail="No file selected.")
+        path = os.path.join(UPLOAD_FOLDER, f"trans_{uuid.uuid4()}_{file.filename}")
+        with open(path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+        ext = ocr_service.detect_file_type(file.filename)
+        warnings = []
+        eff_lang = await asyncio.to_thread(ocr_service.resolve_ocr_lang_for_file, path, ext, ocr_lang or "auto")
+        if eff_lang == "tam" and not ocr_service.is_tesseract_language_available("tam"):
+            warnings.append("Tamil OCR not installed; using English OCR.")
+            eff_lang = "eng"
+        pages = await asyncio.to_thread(ocr_service.extract_text_by_filetype, path, ext, ocr_lang=eff_lang)
+        src_text = "\n".join(pages)
+        if not src_text.strip():
+            warnings.append("OCR could not extract any text from the document.")
+
+        engine = (engine or "auto").lower()
+        force_openai = engine == "openai"
+        force_local = engine == "local"
         if not src_text.strip():
             translated = ""
-        elif _prefer_local_translation or not is_openai_ready():
+        elif force_local or (not force_openai and (_prefer_local_translation or not is_openai_ready())):
             def _detect_script(text: str) -> str:
                 for ch in text:
                     o = ord(ch)
@@ -384,7 +261,7 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
                     gen = mdl.generate(**enc, max_length=900)
                     outs.append(tok.decode(gen[0], skip_special_tokens=True))
                 return "\n".join(outs).strip()
-            fb = _translate_marian(src_text, target_lang, eff_lang)
+            fb = await asyncio.to_thread(_translate_marian, src_text, target_lang, eff_lang)
             translated = (fb or src_text)
             if fb is None:
                 warnings.append("Local translator unavailable; showing original text.")
@@ -396,9 +273,10 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
             attempt = 0
             start = time.perf_counter()
             translated = None
+            client = get_async_openai_client()
             while True:
                 try:
-                    resp = get_openai_client().chat.completions.create(
+                    resp = await client.chat.completions.create(
                         model=OPENAI_MODEL,
                         messages=[{"role":"user","content":prompt}],
                         temperature=0,
@@ -414,18 +292,19 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
                             raise
                         ra = _parse_retry_after_seconds(str(e))
                         if ra > 0:
-                            time.sleep(ra + random.uniform(0.05, 0.25))
+                            await asyncio.sleep(ra + random.uniform(0.05, 0.25))
                         else:
                             d = min(0.5 * (2 ** attempt), 8.0)
                             j = d * 0.3
-                            time.sleep(d + random.uniform(-j, j))
+                            await asyncio.sleep(d + random.uniform(-j, j))
                         attempt += 1
                         if time.perf_counter() - start > 30:
                             raise TimeoutError("Translation timed out")
                         continue
                     raise
     except Exception as e:
-        def _detect_script(text: str) -> str:
+        # Fallback logic if the primary translation (OpenAI or Local) fails
+        def _detect_script_fallback(text: str) -> str:
             for ch in text:
                 o = ord(ch)
                 if 0x0B80 <= o <= 0x0BFF:
@@ -433,7 +312,7 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
                 if 0x0900 <= o <= 0x097F:
                     return "hin"
             return "eng"
-        def _marian_model_for(target: str, source_hint: str) -> Optional[str]:
+        def _marian_model_for_fallback(target: str, source_hint: str) -> Optional[str]:
             t = (target or "").lower()
             s = (source_hint or "").lower()
             if t.startswith("english"):
@@ -442,11 +321,11 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
                 if "hin" in s:
                     return "Helsinki-NLP/opus-mt-hi-en"
             return None
-        def _translate_marian(text: str, target: str, source_hint: str) -> Optional[str]:
-            model_name = _marian_model_for(target, source_hint)
+        def _translate_marian_fallback(text: str, target: str, source_hint: str) -> Optional[str]:
+            model_name = _marian_model_for_fallback(target, source_hint)
             if not model_name:
-                auto = _detect_script(text)
-                model_name = _marian_model_for(target, auto)
+                auto = _detect_script_fallback(text)
+                model_name = _marian_model_for_fallback(target, auto)
             if not model_name:
                 return None
             try:
@@ -462,12 +341,15 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
                 gen = mdl.generate(**enc, max_length=900)
                 outs.append(tok.decode(gen[0], skip_special_tokens=True))
             return "\n".join(outs).strip()
+        
+        # We need src_text here, so ensure it's defined or empty
+        st = src_text if 'src_text' in locals() else ""
         fb = None
         try:
-            fb = _translate_marian(src_text, target_lang, eff_lang)
+            fb = await asyncio.to_thread(_translate_marian_fallback, st, target_lang, eff_lang if 'eff_lang' in locals() else "auto")
         except Exception:
             fb = None
-        translated = fb or src_text
+        translated = fb or st
         msg_raw = str(e)
         msg = msg_raw.lower()
         if "insufficient_quota" in msg or "you exceeded your current quota" in msg or "openai_quota_exhausted" in msg:
@@ -479,24 +361,131 @@ async def translate_analyze(file: UploadFile = File(...), target_lang: str = For
         else:
             warnings.append(f"Translation failed: {str(e)}. Using local translator if available.")
     finally:
-        try:
-            os.remove(path)
-        except Exception:
-            pass
+        if path and os.path.exists(path):
+            try:
+                os.remove(path)
+            except Exception:
+                pass
     
-    rs, an, working_text = analysis_service.analyze_text_overall(translated)
-    base_text = working_text or translated
-    an["timeline"] = analysis_service.build_timeline(base_text)
-    an["document_type"] = analysis_service.classify_document_type(base_text)
-    an["clause_risk"] = analysis_service.clause_risk_detection(base_text, translated_text=working_text)
-    an["signer_validation"] = analysis_service.validate_signers(base_text, rs.get("signers", []))
-    an["jurisdiction_checks"] = analysis_service.jurisdiction_specific_checks(base_text)
-    an["jurisdiction_curated"] = analysis_service.curated_jurisdiction_templates(base_text)
-    an["registration_analysis"] = analysis_service.analyze_registration(base_text)
-    an["combined_risk_index"] = analysis_service.compute_combined_risk_index(an)
-    if warnings:
-        an["warnings"] = warnings
-    return {"translated_text": base_text, "results": rs, "analytics": an}
+    async def run_ai_analysis():
+        rs, an, working_text = await analysis_service.analyze_text_overall_async(translated)
+        base_text = working_text or translated
+
+        tasks = {
+            "timeline": analysis_service.build_timeline_async(base_text),
+            "doc_type": analysis_service.classify_document_type_async(base_text),
+            "clause_risk": analysis_service.clause_risk_detection_async(base_text, translated_text=working_text),
+            "signers": analysis_service.validate_signers_async(base_text, rs.get("signers", [])),
+            "juris_checks": analysis_service.jurisdiction_specific_checks_async(base_text),
+            "juris_curated": analysis_service.curated_jurisdiction_templates_async(base_text),
+            "registration": analysis_service.analyze_registration_async(base_text),
+            "mandatory": analysis_service.check_mandatory_fields_async(base_text),
+            "verification": analysis_service.ask_openai_for_verification_and_confidence_async(base_text),
+            "ml_verification": verification_service.verify_document_async(base_text)
+        }
+
+        task_keys = list(tasks.keys())
+        res_list = await asyncio.gather(*[tasks[k] for k in task_keys], return_exceptions=True)
+        res_map = {}
+        pipeline_errors = []
+        for k, v in zip(task_keys, res_list):
+            if isinstance(v, Exception):
+                pipeline_errors.append({"stage": k, "error": str(v)})
+                # Safe fallbacks per stage
+                if k == "timeline":
+                    res_map[k] = []
+                elif k == "doc_type":
+                    res_map[k] = "Generic Legal Document"
+                elif k == "clause_risk":
+                    res_map[k] = {"clauses": [], "overall_risk": "Unknown", "overall_risk_score": 50}
+                elif k == "signers":
+                    res_map[k] = {"signers": [], "overall_signer_score": None}
+                elif k in {"juris_checks", "juris_curated"}:
+                    res_map[k] = {"jurisdiction": None, "checks": [], "overall_compliance_score": 0}
+                elif k == "registration":
+                    res_map[k] = {"missing_fields": []}
+                elif k == "mandatory":
+                    res_map[k] = {"missing": [], "present": []}
+                elif k == "verification":
+                    res_map[k] = {"marker": "UNVERIFIED", "ai_confidence": 30}
+                elif k == "ml_verification":
+                    res_map[k] = {"marker": "UNVERIFIED", "ai_confidence": 30, "predicted_category": "Generic Legal Document"}
+                else:
+                    res_map[k] = {}
+            else:
+                res_map[k] = v
+
+        verification_data = res_map["verification"] or {}
+        ml_verification = res_map["ml_verification"] or {}
+
+        effective_marker = ml_verification.get("marker") or verification_data.get("marker")
+        effective_ai_confidence = ml_verification.get("ai_confidence")
+        if effective_ai_confidence is None:
+            effective_ai_confidence = verification_data.get("ai_confidence")
+        if effective_ai_confidence is None:
+            effective_ai_confidence = verification_data.get("confidence")
+
+        # Keep document type robust: prefer explicit classifier, fallback to ML verification category
+        doc_type_primary = res_map["doc_type"]
+        doc_type_fallback = ml_verification.get("predicted_category")
+        if not doc_type_primary or str(doc_type_primary).strip().lower() in {"generic legal document", "unknown", "other document"}:
+            if doc_type_fallback and str(doc_type_fallback).strip().lower() not in {"generic legal document", "unknown", "other document"}:
+                doc_type_primary = doc_type_fallback
+
+        an.update({
+            "timeline": res_map["timeline"],
+            "document_type": doc_type_primary,
+            "clause_risk": res_map["clause_risk"],
+            "signer_validation": res_map["signers"],
+            "jurisdiction_checks": res_map["juris_checks"],
+            "jurisdiction_curated": res_map["juris_curated"],
+            "registration_analysis": res_map["registration"],
+            "mandatory_fields": res_map["mandatory"],
+            "verification": verification_data,
+            "ml_verification": ml_verification,
+            "verified_marker": effective_marker,
+            "ai_confidence": effective_ai_confidence
+        })
+
+        # Ensure ai_confidence is not 0 if verified
+        marker_norm = str(an.get("verified_marker") or "").strip().lower()
+        if marker_norm == "verified" and not an.get("ai_confidence"):
+            an["ai_confidence"] = 85
+
+        # Ensure bounded confidence value
+        try:
+            if an.get("ai_confidence") is not None:
+                an["ai_confidence"] = int(max(0, min(100, float(an.get("ai_confidence")))))
+        except Exception:
+            an["ai_confidence"] = 0
+
+        # Scores
+        an["legality_score"] = analysis_service.compute_legality_score(an)
+        an["combined_risk_index"] = compute_combined_risk_index(an)
+        ai_detection_score = analysis_service.compute_ai_detection_score(base_text)
+        an["ai_detection_score"] = 0 if ai_detection_score is None else int(max(0, min(100, ai_detection_score)))
+        an["genuineness_score"] = analysis_service.compute_genuineness_score(an, ml_verification)
+        legal_status = analysis_service.derive_legal_status(an, ml_verification)
+        an["legal_status"] = legal_status.get("status")
+        an["legal_status_reason"] = legal_status.get("reason")
+        an["status_summary"] = legal_status.get("summary")
+        an["supported_document_types_count"] = len(classifier.get_supported_document_types())
+        an["legal_explanation"] = analysis_service.legal_explanation_engine(base_text)
+
+        required_output = analysis_service.build_required_output_schema(rs, an, base_text)
+        an["required_output"] = required_output
+        if warnings:
+            an["warnings"] = warnings
+        if pipeline_errors:
+            an["pipeline_errors"] = pipeline_errors
+        return {
+            "translated_text": base_text,
+            "results": rs,
+            "analytics": an,
+            "output": required_output
+        }
+
+    return await run_ai_analysis()
 
 @router.post("/start-analysis")
 async def start_analysis(req: StartRequest):

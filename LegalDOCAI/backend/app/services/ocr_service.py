@@ -1,7 +1,10 @@
 import os
 import re
 import shutil
-import fitz  # PyMuPDF
+try:
+    import fitz
+except Exception:
+    fitz = None
 from PIL import Image, ImageEnhance, ImageFilter
 
 import concurrent.futures
@@ -25,6 +28,8 @@ def _get_pytesseract():
     return _pt
 
 _easyocr = None
+_easyocr_readers = {} # Cache readers by language tuple
+
 def _get_easyocr():
     global _easyocr
     if _easyocr is None:
@@ -34,6 +39,23 @@ def _get_easyocr():
         except Exception:
             _easyocr = None
     return _easyocr
+
+def _get_cached_reader(langs: List[str], gpu: bool = False):
+    global _easyocr_readers
+    ec = _get_easyocr()
+    if not ec:
+        return None
+    
+    # Sort langs to ensure consistent key
+    lang_key = tuple(sorted(langs))
+    if lang_key not in _easyocr_readers:
+        try:
+            # Only create one reader at a time to avoid memory issues
+            _easyocr_readers[lang_key] = ec.Reader(list(lang_key), gpu=gpu)
+        except Exception as e:
+            print(f"[DEBUG] Failed to initialize EasyOCR reader for {langs}: {e}")
+            return None
+    return _easyocr_readers[lang_key]
 
 _docx_Document = None
 def _get_docx_document():
@@ -137,17 +159,25 @@ def resolve_ocr_lang_for_file(file_path: str, ext: str, requested: str = None) -
         hin_avail = False
     if ext == "pdf":
         try:
-            doc = fitz.open(file_path)
-            sample = ""
-            for i, page in enumerate(doc):
-                sample += page.get_text("text") or ""
-                if i >= 1: break
-            lang = detect_language_simple(sample)
-            if lang == "Tamil" and tam_avail: return "tam+eng"
-            if lang == "Hindi" and hin_avail: return "hin+eng"
-            if tam_avail: return "tam+eng"
-            if hin_avail: return "hin+eng"
-            return "eng"
+            if fitz:
+                doc = fitz.open(file_path)
+                sample = ""
+                for i, page in enumerate(doc):
+                    sample += page.get_text("text") or ""
+                    if i >= 1:
+                        break
+                lang = detect_language_simple(sample)
+                if lang == "Tamil" and tam_avail:
+                    return "tam+eng"
+                if lang == "Hindi" and hin_avail:
+                    return "hin+eng"
+                if tam_avail:
+                    return "tam+eng"
+                if hin_avail:
+                    return "hin+eng"
+                return "eng"
+            else:
+                return "tam+eng" if tam_avail else ("hin+eng" if hin_avail else "eng")
         except Exception:
             return "tam+eng" if tam_avail else ("hin+eng" if hin_avail else "eng")
     if ext in ["png", "jpg", "jpeg"]:
@@ -157,6 +187,8 @@ def resolve_ocr_lang_for_file(file_path: str, ext: str, requested: str = None) -
     return "eng"
 
 def extract_text_from_pdf(file_path: str, ocr_lang: str = None, dpi: int = OCR_DPI_DEFAULT, ocr_engine: str = None) -> List[str]:
+    if not fitz:
+        return [""]
     doc = fitz.open(file_path)
     count = len(doc)
     texts: List[str] = [""] * count
@@ -177,17 +209,18 @@ def extract_text_from_pdf(file_path: str, ocr_lang: str = None, dpi: int = OCR_D
         # Preprocess image for better OCR
         img = preprocess_image(img)
         
-        ec = _get_easyocr()
-        if ocr_engine and ocr_engine.lower() == "easyocr" and ec:
+        if ocr_engine and ocr_engine.lower() == "easyocr":
             try:
                 langs = []
                 if ocr_lang:
                     if "tam" in ocr_lang: langs.append("ta")
                     if "hin" in ocr_lang: langs.append("hi")
                 if not langs: langs = ["en"]
-                reader = ec.Reader(langs, gpu=False)
-                res = reader.readtext(img, detail=0)
-                return "\n".join(res)
+                
+                reader = _get_cached_reader(langs, gpu=False)
+                if reader:
+                    res = reader.readtext(img, detail=0)
+                    return "\n".join(res)
             except Exception: pass
         try:
             pt = _get_pytesseract()
@@ -238,17 +271,18 @@ def extract_text_from_image(file_path: str, ocr_lang: str = None, ocr_engine: st
     # Preprocess for better OCR
     image = preprocess_image(image)
     
-    ec = _get_easyocr()
-    if ocr_engine and ocr_engine.lower() == "easyocr" and ec:
+    if ocr_engine and ocr_engine.lower() == "easyocr":
         try:
             langs = []
             if ocr_lang:
                 if "tam" in ocr_lang: langs.append("ta")
                 if "hin" in ocr_lang: langs.append("hi")
             if not langs: langs = ["en"]
-            reader = ec.Reader(langs, gpu=False)
-            res = reader.readtext(image, detail=0)
-            return ["\n".join(res)]
+            
+            reader = _get_cached_reader(langs, gpu=False)
+            if reader:
+                res = reader.readtext(image, detail=0)
+                return ["\n".join(res)]
         except Exception: pass
     try:
         pt = _get_pytesseract()

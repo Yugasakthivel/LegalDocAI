@@ -383,6 +383,82 @@ async def verify_document_upload(
 ):
     return await verify_document(text=None, doc_id=None, file=file, ocr_lang=ocr_lang)
 
+@router.post("/land/verify")
+async def land_verify(
+    survey_no: str = Form(...),
+    district: str = Form(...),
+    taluk: str = Form(...),
+    village: str = Form(...),
+    sro: str = Form(None),
+    ec_from: str = Form(None),
+    ec_to: str = Form(None),
+    doc_id: str = Form(None),
+):
+    survey_no = (survey_no or "").strip()
+    district = (district or "").strip()
+    taluk = (taluk or "").strip()
+    village = (village or "").strip()
+    sro = (sro or "").strip()
+    ec_from = (ec_from or "").strip()
+    ec_to = (ec_to or "").strip()
+
+    if not survey_no or not district or not taluk or not village:
+        raise HTTPException(status_code=400, detail="survey_no, district, taluk, and village are required")
+
+    corpus = ""
+    if doc_id:
+        d = collection.find_one({"doc_id": doc_id}, {"_id": 0, "combined_text": 1})
+        corpus = (d or {}).get("combined_text", "") or ""
+
+    corpus_lc = corpus.lower()
+    survey_present_in_doc = bool(corpus and re.search(rf"\b{re.escape(survey_no.lower())}\b", corpus_lc))
+    land_classification = analysis_service.extract_land_classification(corpus) if corpus else {
+        "primary_land_type": "Unknown",
+        "land_types_detected": [],
+        "is_property_related": False,
+    }
+    doc_type = analysis_service.classify_document_type(corpus) if corpus else "Unknown"
+
+    return {
+        "request": {
+            "survey_no": survey_no,
+            "district": district,
+            "taluk": taluk,
+            "village": village,
+            "sro": sro or None,
+            "ec_from": ec_from or None,
+            "ec_to": ec_to or None,
+            "doc_id": doc_id or None,
+        },
+        "ownership": {
+            "status": "matched" if survey_present_in_doc else "not_verified",
+            "survey_no_found_in_document": survey_present_in_doc,
+            "document_type": doc_type,
+            "land_classification": land_classification,
+        },
+        "ec": {
+            "status": "pending_external_registry_check",
+            "period": {
+                "from": ec_from or None,
+                "to": ec_to or None,
+            },
+        },
+        "fmb": {
+            "status": "not_connected",
+            "note": "FMB verification requires external survey records integration.",
+        },
+        "zone_checks": {
+            "status": "not_connected",
+            "note": "Zoning check requires DTCP/CMDA or local planning API integration.",
+        },
+        "geo": {
+            "status": "not_connected",
+            "district": district,
+            "taluk": taluk,
+            "village": village,
+        },
+    }
+
 @router.post("/classify/document-type")
 async def classify_document_type_label(text: str = Form(None), doc_id: str = Form(None)):
     corpus = text or ""
@@ -397,4 +473,34 @@ async def classify_document_type_label(text: str = Form(None), doc_id: str = For
             collection.update_one({"doc_id": doc_id}, {"$set": {"analytics.document_type": label}})
         except Exception:
             pass
+    return {"label": label}
+
+@router.post("/classify/document-type/upload")
+async def classify_document_type_upload(
+    file: UploadFile = File(...),
+    ocr_lang: str = Form(None)
+):
+    if not file or not file.filename:
+        raise HTTPException(status_code=400, detail="No file provided")
+
+    try:
+        ext = ocr_service.detect_file_type(file.filename)
+        tmp_path = os.path.join(UPLOAD_FOLDER, f"cls_{uuid.uuid4()}_{file.filename}")
+        with open(tmp_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        eff_lang = ocr_service.resolve_ocr_lang_for_file(tmp_path, ext, ocr_lang or "auto")
+        if eff_lang == "tam" and not ocr_service.is_tesseract_language_available("tam"):
+            eff_lang = "eng"
+        pages = ocr_service.extract_text_by_filetype(tmp_path, ext, ocr_lang=eff_lang)
+        corpus = "\n".join(pages)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to extract text from uploaded file: {e}")
+
+    if not corpus.strip():
+        raise HTTPException(status_code=400, detail="OCR returned empty text")
+
+    label = analysis_service.classify_document_type(corpus)
     return {"label": label}

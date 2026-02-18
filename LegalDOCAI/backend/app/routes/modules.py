@@ -10,7 +10,7 @@ from backend.app.services.risk_service import clause_risk_detection as risk_llm
 from backend.app.services.compliance_service import jurisdiction_checks, curated_checks, mandatory_fields
 from backend.app.services.verification_service import verify_document, validate_signers
 from backend.app.services.storage_service import create_initial_document, get_document, save_document
-from backend.app.vectorstore import add_document, fetch_document_by_id, search as rag_search
+from backend.app.vectorstore import add_document, fetch_document_by_id, search_doc_first
 from backend.app.core.config import UPLOAD_FOLDER
 from backend.app.core.deps import get_current_user, is_openai_ready
 
@@ -162,7 +162,7 @@ async def module_ingest(file: UploadFile = File(...), ocr_lang: str = Form("auto
         save_document(doc_id, {
             "file_info": {
                 "filename": file.filename,
-                "type": ext,
+                "type": file_type,
                 "pages": page_count,
                 "ocr_lang": resolved_lang
             },
@@ -170,9 +170,21 @@ async def module_ingest(file: UploadFile = File(...), ocr_lang: str = Form("auto
                 "pages": page_count
             }
         })
+        doc_type = analysis_service.classify_document_type(combined_text[:6000])
+        doc_category = analysis_service.classify_document_category(combined_text[:6000])
+        two_step = analysis_service.classify_legal_two_step(combined_text[:6000], doc_type)
+        save_document(doc_id, {
+            "analytics.document_type": doc_type,
+            "analytics.document_category": doc_category,
+            "analytics.is_legal_document": bool(two_step.get("is_legal")),
+            "analytics.is_indian_legal_document": bool(two_step.get("is_indian"))
+        })
+        payload["document_type"] = doc_type
+        payload["document_category"] = doc_category
+        payload["is_legal_document"] = bool(two_step.get("is_legal"))
+        payload["is_indian_legal_document"] = bool(two_step.get("is_indian"))
     except Exception:
         pass
-
     # Do not delete temp_path immediately if used as clean_file
     try:
         if clean_file != temp_path:
@@ -242,18 +254,30 @@ async def module_ner(doc_id: str = Form(...)):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     text = doc.get("combined_text") or ""
-    results, analytics, working_text = analysis_service.analyze_text_overall(text)
+    results, analytics, working_text = await analysis_service.analyze_text_overall_async(text)
+    extra = analysis_service.extract_indian_entities(working_text or text)
+    entities = results.get("entities", {}) if isinstance(results, dict) else {}
+    contact_info = results.get("contact_info", {}) if isinstance(results, dict) else {}
     out = {
         "doc_id": doc_id,
         "entities": {
-            "names": results.get("names", []),
-            "organizations": results.get("organizations", []),
-            "emails": results.get("emails", []),
-            "phones": results.get("phones", []),
+            "names": entities.get("names", []),
+            "organizations": entities.get("organizations", []),
+            "emails": contact_info.get("emails", []),
+            "phones": contact_info.get("phones", []),
             "dates": results.get("dates", []),
             "signers": results.get("signers", []),
+            "parties": extra.get("parties", []),
+            "role_parties": extra.get("role_parties", []),
+            "money": extra.get("money", []),
+            "survey_numbers": extra.get("survey_numbers", []),
+            "registration_numbers": extra.get("registration_numbers", []),
+            "case_numbers": extra.get("case_numbers", []),
+            "courts": extra.get("courts", []),
+            "land_types": extra.get("land_types", [])
         },
         "stats": analytics,
+        "property_details": extra.get("property_details", "")
     }
     _update_pipeline(doc_id, "ner", out)
     save_document(doc_id, {"results": results, "analytics": analytics})
@@ -333,8 +357,8 @@ async def module_rag_query(doc_id: str = Form(...), question: str = Form(...), u
             add_document({"doc_id": doc_id, "filename": doc.get("filename"), "combined_text": doc.get("combined_text") or doc.get("text")})
         except Exception:
             pass
-    results = rag_search(question, top_k=3) or []
-    return JSONResponse({"doc_id": doc_id, "answers": results})
+    sources = search_doc_first(question, doc_id, top_k=3) or []
+    return JSONResponse({"doc_id": doc_id, "answers": sources})
 
 
 # MODULE 11 – Document Comparison (file or text)

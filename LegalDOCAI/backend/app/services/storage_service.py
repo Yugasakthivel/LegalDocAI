@@ -20,7 +20,13 @@ def create_initial_document(doc_id: str, filename: str, file_type: str, text: st
         "file_type": file_type,
         "combined_text": text,
         "upload_timestamp": time.time(),
-        "status": "uploaded"
+        "status": "uploaded",
+        "analytics": {
+            "document_type": "Unknown",
+            "verified_marker": "UNVERIFIED",
+            "ai_confidence": None,
+            "legality_score": 0
+        }
     }
     if pages:
         doc["pages"] = pages

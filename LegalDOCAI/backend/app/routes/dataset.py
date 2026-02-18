@@ -125,16 +125,60 @@ async def dataset_qa(text: str = Form(None), doc_id: str = Form(None)):
 
 @router.post("/scan")
 async def dataset_scan(root: str = Form(None), limit: int = Form(None)):
+    from backend.app.services.ocr_service import extract_text, detect_file_type
+    from backend.app.services.storage_service import create_initial_document
+    from backend.app.routes.pipeline import run_full_pipeline
+    import uuid
+
     base = root or os.environ.get("DATASET_ROOT", os.path.join(os.getcwd(), "legal_dataset"))
     raw = os.path.join(base, "raw_documents")
     if not os.path.isdir(raw):
-        raise HTTPException(status_code=404, detail="raw_documents folder not found")
-    allowed = {"pdf","docx","xls","xlsx","png","jpg","jpeg"}
+        # Fallback to a folder named 'dataset' in root if 'legal_dataset/raw_documents' doesn't exist
+        raw = os.path.join(os.getcwd(), "dataset")
+        if not os.path.isdir(raw):
+            raise HTTPException(status_code=404, detail="Dataset folder not found. Please create 'legal_dataset/raw_documents' or 'dataset' folder.")
+    
+    allowed = {"pdf","docx","xls","xlsx","png","jpg","jpeg","txt"}
     processed = []
     skipped = []
-    count = 0
-    # Minimal scan implementation for now
-    return {"processed_count": 0, "skipped_count": 0, "processed": [], "skipped": []}
+    
+    # Get list of files
+    files = [f for f in os.listdir(raw) if os.path.isfile(os.path.join(raw, f))]
+    if limit:
+        files = files[:limit]
+
+    for filename in files:
+        ext = detect_file_type(filename)
+        if ext not in allowed:
+            skipped.append({"filename": filename, "reason": f"Unsupported extension: {ext}"})
+            continue
+            
+        file_path = os.path.join(raw, filename)
+        try:
+            # 1. Extract Text
+            text = extract_text(file_path, file_type=ext)
+            if not text.strip():
+                skipped.append({"filename": filename, "reason": "No text extracted"})
+                continue
+                
+            # 2. Create DB Entry
+            doc_id = str(uuid.uuid4())
+            create_initial_document(doc_id, filename, ext, text)
+            
+            # 3. Run Pipeline
+            # run_full_pipeline is async, but we can call it here
+            await run_full_pipeline(doc_id)
+            
+            processed.append({"filename": filename, "doc_id": doc_id})
+        except Exception as e:
+            skipped.append({"filename": filename, "reason": str(e)})
+
+    return {
+        "processed_count": len(processed),
+        "skipped_count": len(skipped),
+        "processed": processed,
+        "skipped": skipped
+    }
 
 @router.post("/synthetic/land-record")
 async def synthetic_land_record(
