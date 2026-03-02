@@ -11,7 +11,10 @@ import asyncio
 
 try:
     import chromadb
-except ImportError:
+except Exception as e:
+    # chromadb may fail at import-time if onnxruntime/native deps are missing.
+    # Keep backend bootable and fallback to Mongo/local vector logic.
+    print(f"[WARN] chromadb unavailable, using fallback vector search only: {e}")
     chromadb = None
 
 # Initialize Chroma (Singleton-ish)
@@ -64,6 +67,9 @@ def _local_embed(texts: List[str]) -> List[List[float]]:
         return vectors
     except Exception:
         return [[0.0] * 256 for _ in texts]
+
+def local_embed(texts: List[str]) -> List[List[float]]:
+    return _local_embed(texts)
 
 def embed_texts(texts: List[str]) -> List[List[float]]:
     try:
@@ -282,3 +288,33 @@ def fetch_document_by_id(doc_id: str) -> Dict[str, Any]:
     """Return stored document (omit _id)."""
     doc = documents_collection.find_one({"doc_id": doc_id}, {"_id": 0})
     return doc or {}
+
+def chunk_and_index_document(doc_id: str, text: str, chunk_size: int = 300, overlap: int = 50) -> int:
+    if not text:
+        return 0
+    words = text.split()
+    if chunk_size <= 0:
+        chunk_size = 300
+    if overlap < 0:
+        overlap = 0
+    step = max(1, chunk_size - overlap)
+    chunks: List[str] = []
+    i = 0
+    n = len(words)
+    while i < n:
+        end = min(n, i + chunk_size)
+        chunk = " ".join(words[i:end])
+        if chunk:
+            chunks.append(chunk)
+        if end >= n:
+            break
+        i += step
+    cc = get_chroma_collection()
+    if cc:
+        try:
+            for idx, chunk in enumerate(chunks):
+                cid = f"{doc_id}_chunk_{idx}"
+                cc.upsert(ids=[cid], documents=[chunk], metadatas=[{"doc_id": doc_id, "chunk_index": idx}])
+        except Exception:
+            pass
+    return len(chunks)

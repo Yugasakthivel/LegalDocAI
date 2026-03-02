@@ -3,6 +3,7 @@ import time
 import json
 import random
 import math
+import hashlib
 from collections import Counter
 from typing import List, Dict, Any, Optional
 import dateparser
@@ -16,7 +17,14 @@ from backend.app.nlp import (
 import asyncio
 from backend.app.services.ml_service import classifier
 from backend.app.services.compliance_service import jurisdiction_checks
+from backend.app.services.timeline_service import timeline_service
+from backend.app.services.clause_presence_service import clause_presence_service
+from backend.app.services.compliance_checker import compliance_service
+from backend.app.services.comparison_service import comparison_service
+from backend.app.services.rag_service import legal_rag_service
+from backend.app.services.report_service import report_service
 from typing import Tuple
+import httpx
 
 # Constants
 EMAIL_PATTERN = r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+"
@@ -29,7 +37,7 @@ CLAUSE_KEYWORDS = [
 ]
 LAND_TYPE_PATTERNS = {
     "Nanjai": ["nanjai", "wet land", "wetland"],
-    "Punjai": ["punjai", "dry land", "dryland"],
+    "Punjai": ["punjai", "punja", "dry land", "dryland"],
     "Panchami": ["panchami", "pancham"],
     "Agricultural": ["agricultural", "farmland", "cultivable"],
     "Residential": ["residential", "house site", "housing plot"],
@@ -42,55 +50,195 @@ except ImportError:
 
 # --- Helper Functions ---
 
+_ENTITY_STOPWORDS = {
+    "copy", "store", "name", "names", "organization", "organizations",
+    "government", "gov", "govt", "india", "document", "summary",
+    # role/office words that should not be treated as person names
+    "registrar", "register", "sub-registrar", "subregistrar", "office",
+    "department", "vendor", "purchaser", "notary", "witness", "stamp",
+}
+_ORG_HINTS = {
+    "ltd", "limited", "llp", "pvt", "private", "inc", "corp", "company",
+    "co", "bank", "university", "college", "court", "department", "ministry",
+    "authority", "board", "trust", "society", "agency", "institute",
+    "registrar", "registry", "office", "sub-registrar", "cooperative", "coop", "co-op",
+}
+
+def _normalize_entity_text(value: str) -> str:
+    s = (value or "").strip()
+    if not s:
+        return ""
+    try:
+        s = correct_ocr_errors(s) or s
+    except Exception:
+        pass
+    s = re.sub(r"[^A-Za-z\s\.\-&']", " ", s)
+    s = re.sub(r"\s+", " ", s).strip(" .,-")
+    return s
+
+def _looks_like_ocr_noise(value: str) -> bool:
+    s = (value or "").strip()
+    if not s:
+        return True
+    words = re.findall(r"[A-Za-z]{2,}", s)
+    if not words:
+        return True
+    letters = len(re.findall(r"[A-Za-z]", s))
+    if letters < 3:
+        return True
+    bad_long = sum(1 for w in words if len(w) >= 7 and not re.search(r"[aeiou]", w, flags=re.IGNORECASE))
+    if bad_long / max(1, len(words)) > 0.35:
+        return True
+    avg_len = sum(len(w) for w in words) / max(1, len(words))
+    if avg_len > 11.0:
+        return True
+    if re.search(r"(.)\1\1\1", s):
+        return True
+    return False
+
 def sanitize_names(raw: List[str]) -> List[str]:
     cleaned = []
     for n in raw:
-        s = (n or "").strip()
+        s = _normalize_entity_text(n)
         if len(s) < 3 or len(s) > 60: continue
         if re.search(r"\d", s): continue
+        if _looks_like_ocr_noise(s): continue
         tokens = [t for t in s.split() if any(ch.isalpha() for ch in t)]
         if not tokens: continue
+        if len(tokens) < 2: continue
         if len(tokens) > 6: continue
+        if any(t.lower() in _ENTITY_STOPWORDS for t in tokens): continue
+        if any(any(h in t.lower() for h in _ORG_HINTS) for t in tokens): continue
+        latin_tokens = [t for t in tokens if re.search(r"[A-Za-z]", t)]
+        tamil_tokens = [t for t in tokens if re.search(r"[\u0B80-\u0BFF]", t)]
+        if latin_tokens and not tamil_tokens:
+            if any(t.isupper() and len(t) > 24 for t in latin_tokens): continue
+            if any(not (re.match(r"^[A-Z][a-z]+(?:[-'][a-z]+)*$", t) or re.match(r"^[A-Z]\.?$", t) or (t.isupper() and 2 <= len(t) <= 30)) for t in latin_tokens): continue
+            if any(len(t) >= 4 and not re.search(r"[aeiouAEIOU]", t) and not re.match(r"^[A-Z]{2,}$", t) for t in latin_tokens): continue
         joined = " ".join(tokens)
         letters = len(re.findall(r"[A-Za-z]", joined))
         total = len(joined)
         if total == 0 or letters/total < 0.7: continue
-        if len(re.findall(r"[aeiouAEIOU]", joined)) == 0: continue
+        initials_only = latin_tokens and all(re.match(r"^[A-Z]\.?$", t) for t in latin_tokens) and len(latin_tokens) >= 2
+        if latin_tokens and not initials_only:
+            if any(re.search(r"(?i)[bcdfghjklmnpqrstvwxyz]{4,}", t) for t in latin_tokens): continue
+            vowels = len(re.findall(r"[aeiouAEIOU]", joined))
+            all_caps = all(t.isupper() for t in latin_tokens)
+            if not all_caps and (vowels / max(1, letters)) < 0.33: continue
+        if len(re.findall(r"[aeiouAEIOU]", joined)) == 0 and not initials_only: continue
         if len(re.findall(r"[^A-Za-z\s\.\-']", joined)) > max(1, total//10): continue
         cleaned.append(joined)
     seen = set()
     out = []
     for x in cleaned:
-        if x not in seen:
+        key = x.lower()
+        if key not in seen:
             out.append(x)
-            seen.add(x)
+            seen.add(key)
     return out
 
 def sanitize_orgs(raw: List[str]) -> List[str]:
     cleaned = []
     for n in raw:
-        s = (n or "").strip()
+        s = _normalize_entity_text(n)
         if len(s) < 3 or len(s) > 80: continue
+        if _looks_like_ocr_noise(s): continue
         tokens = [t for t in s.split() if any(ch.isalpha() for ch in t)]
         if not tokens: continue
         if len(tokens) > 8: continue
+        has_hint = any((t.lower().strip(".") in _ORG_HINTS) or any(h in t.lower() for h in _ORG_HINTS) for t in tokens)
+        if len(tokens) < 2 and not has_hint: continue
+        short_ok = {"co", "ltd", "pvt", "llp", "inc", "plc", "gov"}
+        if not has_hint and any((len(t) <= 3 and t.lower().strip(".") not in short_ok) for t in tokens):
+            continue
+        if any("coop" in t.lower() for t in tokens):
+            if sum(len(t) for t in tokens) < 10:
+                continue
+        if all(t.lower() in _ENTITY_STOPWORDS for t in tokens):
+            continue
+        latin_tokens = [t for t in tokens if re.search(r"[A-Za-z]", t)]
+        if latin_tokens:
+            if any((t.isupper() and len(t) > 4) for t in latin_tokens): continue
+            if any((not t.isupper()) and (not re.match(r"^[A-Z][a-z][A-Za-z\.\-']{0,30}$", t)) for t in latin_tokens if len(t) > 2): continue
+            if any(re.search(r"(?i)[bcdfghjklmnpqrstvwxyz]{4,}", t) for t in latin_tokens): continue
         joined = " ".join(tokens)
         letters = len(re.findall(r"[A-Za-z]", joined))
         total = len(joined)
         if total == 0 or letters/total < 0.6: continue
+        if latin_tokens:
+            vowels = len(re.findall(r"[aeiouAEIOU]", joined))
+            all_caps = all(t.isupper() for t in latin_tokens)
+            if not all_caps and (vowels / max(1, letters)) < 0.3: continue
         if len(re.findall(r"[^A-Za-z0-9\s\.\-&']", joined)) > max(1, total//10): continue
         cleaned.append(joined)
     seen = set()
     out = []
     for x in cleaned:
-        if x not in seen:
+        key = x.lower()
+        if key not in seen:
             out.append(x)
-            seen.add(x)
+            seen.add(key)
     return out
+
+def extract_tamil_names(text: str) -> List[str]:
+    out: List[str] = []
+    t = (text or "")
+    for m in re.finditer(r"([\u0B80-\u0BFF]{2,12}(?:\s+[\u0B80-\u0BFF]{2,12}){1,3})", t):
+        s = re.sub(r"\s+", " ", m.group(1)).strip()
+        if 3 <= len(s) <= 80:
+            out.append(s)
+        if len(out) >= 8:
+            break
+    return out
+
+def transliterate_tamil_to_latin(text: str) -> str:
+    t = text or ""
+    vowels = {
+        "அ": "a","ஆ": "aa","இ": "i","ஈ": "ii","உ": "u","ஊ": "uu","எ": "e","ஏ": "ee","ஐ": "ai","ஒ": "o","ஓ": "oo","ஔ": "au",
+    }
+    vowel_signs = {
+        "ா": "aa","ி": "i","ீ": "ii","ு": "u","ூ": "uu","ெ": "e","ே": "ee","ை": "ai","ொ": "o","ோ": "oo","ௌ": "au",
+    }
+    cons = {
+        "க": "k","ங": "ng","ச": "ch","ஜ": "j","ஞ": "nj","ட": "t","ண": "n","த": "th","ந": "n","ப": "p","ம": "m","ய": "y","ர": "r","ல": "l","வ": "v","ழ": "zh","ள": "l","ற": "r","ன": "n",
+    }
+    pulli = "்"
+    out = []
+    i = 0
+    n = len(t)
+    while i < n:
+        ch = t[i]
+        if ch in vowels:
+            out.append(vowels[ch])
+            i += 1
+            continue
+        if ch in cons:
+            base = cons[ch]
+            next_ch = t[i+1] if i+1 < n else ""
+            if next_ch in vowel_signs:
+                out.append(base + vowel_signs[next_ch])
+                i += 2
+                continue
+            if next_ch == pulli:
+                out.append(base)
+                i += 2
+                continue
+            out.append(base + "a")
+            i += 1
+            continue
+        if ch in vowel_signs:
+            out.append(vowel_signs[ch])
+            i += 1
+            continue
+        i += 1
+    s = "".join(out)
+    s = re.sub(r"[^A-Za-z\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
 def extract_signatures(text: str) -> List[str]:
     found = []
-    for m in re.finditer(r"(signed by|signature|authorized signatory|attested by)\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)", text, flags=re.IGNORECASE):
+    for m in re.finditer(r"(digitally\s+signed(?:\s+by)?|signed by|signature|authorized signatory|attested by)\s*[:\-]?\s*([A-Za-z][A-Za-z\s]+)", text, flags=re.IGNORECASE):
         nm = m.group(2).strip()
         if nm and nm not in found:
             found.append(nm)
@@ -110,7 +258,8 @@ def extract_phones_validated(text: str) -> List[str]:
                 if len(digits) != 10 or digits[0] not in "6789": continue
                 val = f"+91 {digits}"
                 if val not in out: out.append(val)
-        except Exception: pass
+        except Exception as e:
+            print(f"[DEBUG] PhoneNumberMatcher failed: {e}")
     if not out:
         for m in re.finditer(r"(\+?\d[\d\-\s\(\)]{6,}\d)", text):
             s = m.group(1)
@@ -149,10 +298,92 @@ def detect_clause_headings(text: str) -> List[str]:
         l = line.strip()
         if not l or len(l) > 120: continue
         if re.match(r"^(\d+(\.\d+)*|\([a-zA-Z]\)|[A-Z][A-Za-z\s]{2,})", l):
-            upper_ratio = sum(1 for c in l if c.isupper())/max(1,len(re.sub(r"[^A-Za-z]","",l)))
+            alpha_only = re.sub(r"[^A-Za-z]","",l)
+            upper_ratio = sum(1 for c in alpha_only if c.isupper())/max(1,len(alpha_only))
             if upper_ratio > 0.6 or re.match(r"^\d+(\.\d+)*\s", l) or re.match(r"^\([a-zA-Z]\)\s", l):
                 if l not in heads: heads.append(l)
     return heads
+
+def extract_structured_layout(text: str) -> List[Dict[str, Any]]:
+    """
+    Groups text into headings, paragraphs, and potential tables for layout awareness.
+    """
+    headings = set(detect_clause_headings(text))
+    layout = []
+    current_block = []
+    
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if not line:
+            i += 1
+            continue
+            
+        # Detect table-like structures (e.g., lines with multiple tabs or large spaces)
+        if re.search(r"\s{4,}", line) or line.count("\t") >= 2:
+            if current_block:
+                layout.append({"type": "paragraph", "content": " ".join(current_block)})
+                current_block = []
+            
+            table_rows = []
+            while i < len(lines) and (re.search(r"\s{3,}", lines[i]) or lines[i].count("\t") >= 1 or not lines[i].strip()):
+                if lines[i].strip():
+                    # Split by 3+ spaces or tab
+                    cells = re.split(r"\s{3,}|\t", lines[i].strip())
+                    table_rows.append(cells)
+                i += 1
+            layout.append({"type": "table", "content": table_rows})
+            continue
+
+        if line in headings:
+            if current_block:
+                layout.append({"type": "paragraph", "content": " ".join(current_block)})
+                current_block = []
+            layout.append({"type": "heading", "content": line})
+        else:
+            current_block.append(line)
+        i += 1
+            
+    if current_block:
+        layout.append({"type": "paragraph", "content": " ".join(current_block)})
+        
+    return layout
+
+def compute_layout_score(text: str) -> float:
+    """
+    Computes a numerical layout score based on text structural consistency.
+    Checks for balanced paragraphs, heading density, and alignment hints.
+    """
+    if not text or len(text) < 100:
+        return 0.5
+        
+    lines = text.splitlines()
+    total_lines = len(lines)
+    
+    # 1. Heading Density (Authentic legal docs have structured headings)
+    headings = detect_clause_headings(text)
+    heading_ratio = len(headings) / max(1, total_lines / 20) # Expect ~1 heading per 20 lines
+    h_score = min(1.0, heading_ratio)
+    
+    # 2. Line Length Consistency (Center-aligned or chaotic text is suspicious)
+    line_lengths = [len(l.strip()) for l in lines if len(l.strip()) > 5]
+    if not line_lengths:
+        return 0.5
+    avg_len = sum(line_lengths) / len(line_lengths)
+    variance = sum((x - avg_len) ** 2 for x in line_lengths) / len(line_lengths)
+    std_dev = variance ** 0.5
+    
+    # Highly chaotic line lengths (standard dev > 30) suggest poor OCR or layout tampering
+    l_score = 1.0 - min(0.5, std_dev / 100)
+    
+    # 3. Structural Consistency (Tables/Lists)
+    structured_blocks = extract_structured_layout(text)
+    table_count = sum(1 for b in structured_blocks if b["type"] == "table")
+    s_score = min(1.0, 0.5 + (table_count * 0.1))
+    
+    final_score = (h_score * 0.3) + (l_score * 0.4) + (s_score * 0.3)
+    return float(final_score)
 
 def extract_land_classification(text: str) -> Dict[str, Any]:
     t = (text or "").lower()
@@ -173,50 +404,316 @@ def extract_land_classification(text: str) -> Dict[str, Any]:
 
 def summarize_fallback(text: str, max_words: int = 120) -> str:
     """
-    Summarize text using frequency-based extraction (Rule-Based).
+    Summarize text using high-speed local service (Hybrid Map-Reduce/TextRank).
     """
-    nlp = _get_nlp()
-    if nlp:
-        doc = nlp(text)
-        sents = [s.text.strip() for s in doc.sents if len(s.text.strip()) > 30]
-        if not sents:
-             return "Text too short to summarize."
-             
-        # Keyword frequency
-        freq = Counter(t.lemma_.lower() for t in doc if not t.is_stop and not t.is_punct and t.is_alpha)
-        maxf = max(freq.values()) if freq else 1
-        
-        sent_scores = {}
-        for s in sents:
-            s_doc = nlp(s.lower())
-            score = sum(freq.get(t.lemma_.lower(),0)/maxf for t in s_doc)
-            # Normalize by length to avoid favoring long sentences
-            sent_scores[s] = score / max(1, len(s_doc))
-            
-        # Pick top 3
-        top_sents = sorted(sent_scores, key=sent_scores.get, reverse=True)[:3]
-        return " ".join(top_sents)
-    else:
-        # Fallback without SpaCy
-        return text[:500] + "..."
+    from backend.app.services.summarization_service import summarization_service
+    res = summarization_service.summarize_chunked(text)
+    return res["summary"]
+
+def _normalize_spaces(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip()
+
+def _is_resume_like(text: str) -> bool:
+    t = (text or "").lower()
+    if not t:
+        return False
+    cues = [
+        "objective",
+        "professional summary",
+        "skills",
+        "certifications",
+        "projects",
+        "internship",
+        "education",
+        "cgpa",
+        "diploma",
+        "b.e",
+        "b.tech",
+        "resume",
+    ]
+    hits = sum(1 for c in cues if c in t)
+    return hits >= 3
+
+def _split_resume_sections(text: str) -> Dict[str, List[str]]:
+    normalized = _normalize_spaces(text)
+    if not normalized:
+        return {}
+    header_map = {
+        r"objective": "objective",
+        r"professional summary|summary": "summary",
+        r"skills\s*&\s*abilities|skills\s+and\s+abilities|skills": "skills",
+        r"certifications?": "certifications",
+        r"projects?": "projects",
+        r"internship|intern": "internship",
+        r"education|diploma|b\.e|b\.tech|bachelor": "education",
+    }
+    for pattern, key in header_map.items():
+        normalized = re.sub(rf"(?i)\b({pattern})\b", rf"\n{key}:", normalized)
+    lines = [l.strip() for l in normalized.split("\n") if l.strip()]
+    sections: Dict[str, List[str]] = {}
+    current = None
+    for line in lines:
+        if line.endswith(":"):
+            current = line[:-1].strip().lower()
+            sections.setdefault(current, [])
+            continue
+        if current:
+            sections[current].append(line)
+    return sections
+
+def _clean_resume_fragment(text: str, max_chars: int = 220) -> str:
+    t = _normalize_spaces(text)
+    if len(t) > max_chars:
+        t = t[:max_chars].rsplit(" ", 1)[0].strip()
+    return t
+
+def summarize_resume(text: str) -> str:
+    sections = _split_resume_sections(text or "")
+    parts: List[str] = []
+
+    summary_blob = " ".join(sections.get("summary", []) + sections.get("objective", []))
+    if summary_blob:
+        parts.append(f"Objective: {_clean_resume_fragment(summary_blob, 220)}")
+
+    edu_blob = " ".join(sections.get("education", []))
+    if not edu_blob:
+        edu_blob = text
+    edu_bits = []
+    for m in re.finditer(r"(?i)\b(diploma|b\.e|b\.tech|bachelor)\b[^\.]{0,80}", edu_blob):
+        edu_bits.append(_clean_resume_fragment(m.group(0), 120))
+    cgpa = re.search(r"(?i)\b(cgpa|gpa)\b[^0-9]{0,6}([0-9]\.?[0-9]?)", edu_blob)
+    if edu_bits or cgpa:
+        edu_text = "; ".join(dict.fromkeys(edu_bits))[:180]
+        if cgpa:
+            edu_text = f"{edu_text} CGPA {cgpa.group(2)}".strip()
+        if edu_text:
+            parts.append(f"Education: {edu_text}")
+
+    skills_blob = " ".join(sections.get("skills", []))
+    if skills_blob:
+        skills = [s.strip() for s in re.split(r"[,/|]", skills_blob) if s.strip()]
+        if skills:
+            parts.append(f"Skills: {', '.join(skills[:8])}")
+
+    cert_blob = " ".join(sections.get("certifications", []))
+    if cert_blob:
+        certs = [c.strip() for c in re.split(r"[,/|]", cert_blob) if c.strip()]
+        if certs:
+            parts.append(f"Certifications: {', '.join(certs[:4])}")
+
+    proj_blob = " ".join(sections.get("projects", []))
+    if proj_blob:
+        proj_bits = [p.strip() for p in re.split(r"→|;|\|", proj_blob) if p.strip()]
+        if proj_bits:
+            parts.append(f"Projects: {', '.join(proj_bits[:3])}")
+
+    intern_blob = " ".join(sections.get("internship", []))
+    if intern_blob:
+        parts.append(f"Internship: {_clean_resume_fragment(intern_blob, 140)}")
+
+    if not parts:
+        return _normalize_spaces(text or "")[:320] + "..."
+
+    return " ".join(parts)
+
+def _summary_needs_fix(summary: str) -> bool:
+    if not summary:
+        return True
+    s = summary.strip()
+    if len(s) < 40:
+        return True
+    if len(s) > 500 and s.count(".") < 2:
+        return True
+    if len(re.findall(r"[A-Za-z]", s)) < 20:
+        return True
+    # OCR-gibberish guard: too many long tokens without vowels usually means unreadable text.
+    words = re.findall(r"[A-Za-z]{2,}", s)
+    if len(words) < 8:
+        return True
+    no_vowel_long = sum(1 for w in words if len(w) >= 7 and not re.search(r"[aeiou]", w, flags=re.IGNORECASE))
+    if no_vowel_long / max(1, len(words)) > 0.2:
+        return True
+    avg_len = sum(len(w) for w in words) / max(1, len(words))
+    if avg_len > 9.5:
+        return True
+    return False
+
+def _extract_readable_sentences(text: str, limit: int = 2) -> List[str]:
+    t = _normalize_spaces(text or "")
+    if not t:
+        return []
+    sents = [s.strip() for s in re.split(r"(?<=[\.\!\?])\s+|\n+", t) if s and s.strip()]
+    out: List[str] = []
+    for s in sents:
+        if len(s) < 35:
+            continue
+        if _looks_like_ocr_noise(s):
+            continue
+        words = re.findall(r"[A-Za-z]{2,}", s)
+        if len(words) < 6:
+            continue
+        out.append(s)
+        if len(out) >= limit:
+            break
+    return out
+
+def _build_structured_summary(
+    doc_type: str,
+    names: List[str],
+    orgs: List[str],
+    dates: List[str],
+    clause_counter: Counter,
+    source_text: str,
+) -> str:
+    parts: List[str] = []
+    d_type = (doc_type or "").strip()
+    if d_type and d_type.lower() not in {"unknown", "other", "other document"}:
+        parts.append(f"Document type: {d_type}.")
+    if names:
+        parts.append(f"Names: {', '.join((names or [])[:3])}.")
+    if orgs:
+        parts.append(f"Organizations: {', '.join((orgs or [])[:2])}.")
+    if dates:
+        parts.append(f"Dates: {', '.join((dates or [])[:3])}.")
+    try:
+        top_clauses = [k for k, v in (clause_counter or {}).most_common(5) if int(v or 0) > 0][:3]
+    except Exception:
+        top_clauses = []
+    if top_clauses:
+        parts.append(f"Key clauses detected: {', '.join(top_clauses)}.")
+    readable = _extract_readable_sentences(source_text or "", limit=1)
+    if readable:
+        parts.append(readable[0])
+    if not parts:
+        return "No clean summary available from OCR text. Please upload a clearer scan."
+    return _normalize_spaces(" ".join(parts))
+
+async def translate_text_simple_async(text: str, target_lang: str) -> str:
+    try:
+        tgt = (target_lang or "English").strip()
+        if not (text or "").strip():
+            return ""
+        async with httpx.AsyncClient(timeout=12) as client:
+            resp = await client.get(
+                "https://api.mymemory.translated.net/get",
+                params={"q": (text or "")[:5000], "langpair": f"en|{tgt[:2].lower()}"},
+            )
+            data = resp.json()
+            out = ((data or {}).get("responseData") or {}).get("translatedText") or ""
+            return out or text
+    except Exception:
+        return text
 
 def answer_with_fallback(question: str, context: str) -> str:
-    # Rule-based QA (Simple Keyword Search)
-    q_tokens = set(re.findall(r"\w+", question.lower())) - {"what", "is", "the", "of", "in", "a", "an", "to"}
-    if not q_tokens: return "Could not understand question."
-    
-    # Split context into sentences
-    sentences = re.split(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s", context)
+    q = (question or "").strip().lower()
+    t = (context or "").strip()
+    if not t:
+        return "Document has no text content."
+    # Targeted Q&A shortcuts
+    if any(k in q for k in ["name", "person", "who", "party", "signer"]):
+        bad_name_words = {
+            "tamil", "nadu", "india", "government", "govt", "office", "department", "district", "state",
+            "taluk", "village", "survey", "road", "street", "pincode", "pin", "lic", "license", "licence",
+            "number", "no", "stamp", "bond", "ec", "uidai", "passport", "card", "authority"
+        }
+
+        def _clean_person_name(x: str) -> str:
+            s = re.sub(r"[^A-Za-z\s\.\-']", " ", (x or "")).strip()
+            s = re.sub(r"\s+", " ", s)
+            return s
+
+        def _is_likely_person_name(x: str) -> bool:
+            s = _clean_person_name(x)
+            if len(s) < 3 or len(s) > 80:
+                return False
+            if re.search(r"\d", s):
+                return False
+            toks = [tok.strip(" .") for tok in s.split() if tok.strip(" .")]
+            if not toks:
+                return False
+            lowered = [tok.lower() for tok in toks]
+            if any(tok in bad_name_words for tok in lowered):
+                return False
+            # Prefer proper person-like names: at least 2 clean tokens.
+            alpha_toks = [tok for tok in toks if re.search(r"[A-Za-z]", tok)]
+            if len(alpha_toks) < 2:
+                return False
+            # Filter all-uppercase OCR garbage chunks.
+            if sum(1 for tok in alpha_toks if tok.isupper() and len(tok) > 2) >= 2:
+                return False
+            return True
+
+        try:
+            ents = shared_perform_ner(t)
+            names = sanitize_names(ents.get("names") or [])
+        except Exception:
+            names = []
+        role_hits = []
+        role_patterns = [
+            r"\b(?:name|holder name|owner name|applicant name)\s*[:\-]\s*([A-Za-z][A-Za-z\s\.\-']{2,80})",
+            r"\b(?:vendor|purchaser|lessor|lessee|tenant|landlord|donor|donee|petitioner|respondent)\s*[:\-]?\s*([A-Za-z][A-Za-z\s\.\-']{2,80})",
+            r"\b(?:signed by|signature of|authorized signatory)\s*[:\-]?\s*([A-Za-z][A-Za-z\s\.\-']{2,80})",
+        ]
+        for pat in role_patterns:
+            for m in re.finditer(pat, t, flags=re.IGNORECASE):
+                role_hits.append(m.group(1).strip())
+        if not names:
+            for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b", t):
+                role_hits.append(m.group(1).strip())
+        merged = []
+        for cand in list(names) + role_hits:
+            cleaned = _clean_person_name(cand)
+            if _is_likely_person_name(cleaned):
+                merged.append(cleaned)
+        out = []
+        seen = set()
+        for nm in merged:
+            key = nm.lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(nm)
+            if len(out) >= 8:
+                break
+        return ", ".join(out) if out else "No clear person names detected in the document."
+    if any(k in q for k in ["email", "mail id", "e-mail"]):
+        emails = list(dict.fromkeys(re.findall(EMAIL_PATTERN, t)))
+        return ", ".join(emails[:5]) if emails else "No emails detected"
+    if any(k in q for k in ["phone", "mobile", "contact number", "contact"]):
+        phones = extract_phones_validated(t)
+        out = [p if isinstance(p, str) else (p.get("normalized") or p.get("number") or "") for p in phones]
+        out = [x for x in out if x]
+        return ", ".join(out[:5]) if out else "No phone numbers detected"
+    if "pan" in q:
+        pans = re.findall(r"\b[A-Z]{5}\d{4}[A-Z]\b", t)
+        pans = list(dict.fromkeys(pans))
+        return ", ".join(pans[:3]) if pans else "PAN not found"
+    if any(k in q for k in ["aadhaar", "aadhar", "uidai"]):
+        nums = [m.group(0) for m in re.finditer(r"\b\d{12}\b", t)]
+        return ", ".join(nums[:3]) if nums else "Aadhaar not found"
+    if any(k in q for k in ["date", "dated", "timeline"]):
+        dates = []
+        for m in re.finditer(DATE_PATTERN, t):
+            raw = m.group(0)
+            try:
+                parsed = dateparser.parse(raw)
+                dates.append(parsed.strftime("%d/%m/%Y") if parsed else raw)
+            except Exception:
+                dates.append(raw)
+        dates = list(dict.fromkeys(dates))
+        return ", ".join(dates[:8]) if dates else "No dates detected"
+    # Fallback: sentence overlap
+    q_tokens = set(re.findall(r"\w+", q)) - {"what", "is", "the", "of", "in", "a", "an", "to"}
+    if not q_tokens:
+        return "Could not understand question."
+    sentences = re.split(r"(?<!\w\.\w.)(?<![A-Z][a-z]\.)(?<=\.|\?)\s", t)
     best_sent = "Not found."
     max_overlap = 0
-    
     for s in sentences:
         s_tokens = set(re.findall(r"\w+", s.lower()))
         overlap = len(q_tokens.intersection(s_tokens))
         if overlap > max_overlap:
             max_overlap = overlap
             best_sent = s.strip()
-            
     if max_overlap > 0:
         return best_sent
     return "Not available in the document"
@@ -343,11 +840,11 @@ async def analyze_text_overall_async(full_text: str):
     orgs = sanitize_orgs(ner_results.get("organizations", []))
     signers = extract_signatures(full_text)
     try:
-        indian = extract_indian_entities(full_text)
+        indian = extract_indian_entities(working_text or full_text)
     except Exception:
         indian = {"parties": [], "role_parties": [], "registration_numbers": [], "survey_numbers": [], "case_numbers": [], "courts": [], "land_types": [], "dates": [], "money": [], "property_details": "", "role_parties": []}
     if indian:
-        names = sanitize_names((names or []) + (indian.get("parties") or []) + (indian.get("role_parties") or []))
+        names = sanitize_names((names or []) + (indian.get("parties") or []) + (indian.get("role_parties") or []) + (signers or []))
     
     emails = reg_results["emails"]
     phone_details = reg_results["phone_details"]
@@ -356,6 +853,23 @@ async def analyze_text_overall_async(full_text: str):
     case_numbers = reg_results["case_numbers"]
     authorities = reg_results["authorities"]
     dates = reg_results["dates"]
+    try:
+        low = (full_text or "").lower()
+        tamil_present = any(0x0B80 <= ord(ch) <= 0x0BFF for ch in (full_text or ""))
+        property_cues = ("non judicial" in low) or ("stamp paper" in low) or ("sub registrar" in low) or ("stamp vendor" in low)
+        if tamil_present and property_cues:
+            tn = extract_tamil_names(full_text or "")
+            tn_lat = [transliterate_tamil_to_latin(x) for x in tn if x]
+            names = sanitize_names((names or []) + tn_lat)
+        authority_whitelist = ["Sub Registrar", "Stamp Vendor", "Government of Tamil Nadu", "Revenue Department", "District Registrar"]
+        detected_auths = []
+        for aterm in authority_whitelist:
+            if aterm.lower() in low:
+                detected_auths.append(aterm)
+        if detected_auths:
+            orgs = sanitize_orgs((orgs or []) + detected_auths)
+    except Exception:
+        pass
 
     # SpaCy Analysis (Summary and Keywords)
     def _spacy_analysis(text):
@@ -385,6 +899,22 @@ async def analyze_text_overall_async(full_text: str):
         return summary, keyword_frequency
 
     summary, keyword_frequency = await asyncio.to_thread(_spacy_analysis, working_text)
+    summary_source_text = working_text or full_text
+    if _is_resume_like(summary_source_text) or _summary_needs_fix(summary):
+        summary = summarize_fallback(summary_source_text)
+    try:
+        summary = _normalize_spaces(correct_ocr_errors(summary) or summary)
+    except Exception:
+        summary = _normalize_spaces(summary)
+    if _summary_needs_fix(summary):
+        summary = _build_structured_summary(
+            doc_type="",
+            names=names,
+            orgs=orgs,
+            dates=dates,
+            clause_counter=Counter(),
+            source_text=working_text or full_text,
+        )
     land_classification = extract_land_classification(full_text)
 
     # Clause Detection
@@ -392,6 +922,17 @@ async def analyze_text_overall_async(full_text: str):
     clause_counter = Counter()
     for kw in CLAUSE_KEYWORDS:
         clause_counter[kw] = len(re.findall(r"\b" + re.escape(kw) + r"\b", search_text, flags=re.IGNORECASE))
+    if _summary_needs_fix(summary) or _looks_like_ocr_noise(summary):
+        summary = _build_structured_summary(
+            doc_type="",
+            names=names,
+            orgs=orgs,
+            dates=dates,
+            clause_counter=clause_counter,
+            source_text=working_text or full_text,
+        )
+    if _summary_needs_fix(summary):
+        summary = "No clean summary available from OCR text. Please upload a clearer scan."
     
     # Aggregate
     results = {
@@ -435,28 +976,22 @@ def analyze_text_overall(full_text: str):
     return asyncio.run(analyze_text_overall_async(full_text))
 
 async def build_timeline_async(full_text: str) -> List[Dict[str, Any]]:
-    nlp = _get_nlp()
-    sents: List[str] = []
-    if nlp:
-        def _get_sents(text):
-            doc = nlp(text)
-            return [s.text.strip() for s in doc.sents if s.text.strip()]
-        sents = await asyncio.to_thread(_get_sents, full_text[:10000])
-    else:
-        sents = [x.strip() for x in re.split(r"(?<=[\.\!\?\n])\s+", full_text) if x.strip()]
-    
-    events: List[Dict[str, Any]] = []
-    for sent in sents:
-        found = re.findall(DATE_PATTERN, sent)
-        for d in found:
-            parsed = dateparser.parse(d)
-            if parsed:
-                events.append({"date": str(parsed.date()), "event": sent})
+    """
+    Module 8: Timeline Extraction.
+    Uses TimelineService for robust event-date linking and chronological sorting.
+    """
+    try:
+        res = await asyncio.to_thread(timeline_service.extract_timeline, full_text)
+        events = res.get("timeline", [])
+    except Exception as e:
+        print(f"[DEBUG] build_timeline_async error: {e}")
+        events = []
     
     if not events and is_openai_ready():
         try:
             prompt = (
-                "Extract a timeline from the legal document. "
+                "Extract a chronological timeline of key events from the legal document. "
+                "Include effective dates, execution dates, payment deadlines, and termination events. "
                 "Return ONLY a JSON array of objects with keys \"date\" (YYYY-MM-DD) and \"event\". "
                 "Document:\n" + full_text[:4000]
             )
@@ -468,13 +1003,12 @@ async def build_timeline_async(full_text: str) -> List[Dict[str, Any]]:
             )
             raw = (resp.choices[0].message.content or "").strip()
             import json
-            # Extract JSON array
             start = raw.find("[")
             end = raw.rfind("]") + 1
             if start != -1:
                 events = json.loads(raw[start:end])
         except Exception as e:
-            print(f"[DEBUG] build_timeline_async error: {e}")
+            print(f"[DEBUG] build_timeline_async OpenAI error: {e}")
             try:
                 msg = str(e).lower()
                 if "429" in msg or "insufficient_quota" in msg or "quota" in msg:
@@ -482,7 +1016,7 @@ async def build_timeline_async(full_text: str) -> List[Dict[str, Any]]:
             except Exception:
                 pass
             
-    return sorted(events, key=lambda x: x.get("date", ""))[:15]
+    return sorted(events, key=lambda x: x.get("date", ""))[:20]
 
 async def validate_signers_async(full_text: str, signers: List[str]) -> Dict[str, Any]:
     if not is_openai_ready():
@@ -562,7 +1096,8 @@ def classify_document_type(full_text: str) -> str:
         if rule_label:
             return rule_label
 
-        prediction, confidence = classifier.predict_document_type(full_text)
+        res = classifier.predict_document_type(full_text)
+        prediction, confidence = res[0], res[1]
 
         if confidence < 0.50 or prediction in ["Generic Legal Document", "Unknown", "Other Document"]:
             if rule_label:
@@ -725,7 +1260,7 @@ def classify_document_category(full_text: str) -> str:
     t = (full_text or "")
     doc_type = classify_document_type(t)
     land_types = {
-        "Patta","Chitta","TSLR","FMB Sketch","Layout Approval","Sale Deed","Settlement Deed",
+        "Patta","Chitta","TSLR","FMB Sketch","Layout Approval","Sale Deed","Settlement Deed","Land Property",
         "Partition Deed","Release Deed","Rectification Deed","Encumbrance Certificate","Mortgage Deed",
         "Power of Attorney","Gift Deed"
     }
@@ -761,12 +1296,582 @@ def classify_document_category(full_text: str) -> str:
         return "Financial Document"
     if doc_type in employment_types:
         return "Employment Document"
-    if doc_type in {"Resume","Invoice","ID Card"}:
+    if doc_type in {"Resume","Invoice","ID Card","Application Interface Screenshot"}:
         return "Non-Legal Document"
     return "Other"
 
 async def classify_document_category_async(full_text: str) -> str:
     return await asyncio.to_thread(classify_document_category, full_text)
+
+
+def deterministic_classify_document(full_text: str) -> Dict[str, str]:
+    text = (full_text or "").strip()
+    lower = text.lower()
+    first500 = text[:500]
+    word_count = len(re.findall(r"\b\w+\b", text))
+    stability_hash = hashlib.sha256(f"{first500}|{word_count}".encode("utf-8", errors="ignore")).hexdigest()
+
+    if not text:
+        return {
+            "document_type": "UNKNOWN",
+            "rule_match_score": "0%",
+            "ml_confidence": "0%",
+            "final_confidence": "0%",
+            "classification_source": "ML",
+            "stability_hash": stability_hash,
+        }
+
+    rule_sets: Dict[str, List[str]] = {
+        "Patta": [
+            "patta number", "survey number", "taluk", "village", "revenue department", "district", "tslr",
+        ],
+        "Sale Deed": [
+            "vendor", "purchaser", "sale consideration", "schedule property", "registered at sub registrar",
+        ],
+        "Lease Deed": [
+            "lessor", "lessee", "lease period", "monthly rent", "security deposit",
+        ],
+        "Court Order": [
+            "in the court of", "petitioner", "respondent", "case no", "order dated",
+        ],
+        "Non Judicial Stamp Paper": [
+            "non judicial", "india non judicial", "stamp paper", "stamp vendor", "lic no", "tamil nadu",
+        ],
+    }
+
+    def _contains_phrase(phrase: str) -> bool:
+        return phrase in lower
+
+    # STEP 1: rule-priority strict matching.
+    best_label = ""
+    best_hits = 0
+    best_total = 1
+    for label, phrases in rule_sets.items():
+        hits = sum(1 for p in phrases if _contains_phrase(p))
+        if hits > best_hits:
+            best_hits = hits
+            best_total = len(phrases)
+            best_label = label
+
+    rule_pct = int(round((best_hits / max(1, best_total)) * 100))
+
+    # STEP 2: structural validation.
+    has_title_header = any(k in lower for k in ["deed", "order", "certificate", "patta", "court"])
+    has_authority_ref = any(k in lower for k in ["sub registrar", "revenue department", "court", "tahsildar", "district"])
+    has_format_pattern = any(k in lower for k in ["no.", "number", "dated", "date", "case no", "survey number", ":"])
+    structure_score = int(has_title_header) + int(has_authority_ref) + int(has_format_pattern)
+
+    if best_label == "Non Judicial Stamp Paper" and best_hits >= 2:
+        return {
+            "document_type": "Non Judicial Stamp Paper",
+            "rule_match_score": f"{rule_pct}%",
+            "ml_confidence": "0%",
+            "final_confidence": "92%",
+            "classification_source": "RULE",
+            "stability_hash": stability_hash,
+        }
+
+    if best_hits >= 3:
+        # Deterministic high-confidence rule result.
+        base_conf = 96
+        if structure_score == 2:
+            base_conf = 94
+        elif structure_score <= 1:
+            base_conf = 90
+        return {
+            "document_type": best_label,
+            "rule_match_score": f"{rule_pct}%",
+            "ml_confidence": "0%",
+            "final_confidence": f"{base_conf}%",
+            "classification_source": "RULE",
+            "stability_hash": stability_hash,
+        }
+
+    # STEP 3: ML fallback only when no rule threshold match.
+    try:
+        res = classifier.predict_document_type(text)
+        pred, conf, m_version = res[0], res[1], res[2]
+        ml_pct = int(round(max(0.0, min(1.0, float(conf or 0.0))) * 100))
+        if ml_pct < 60:
+            return {
+                "document_type": "UNKNOWN",
+                "rule_match_score": f"{rule_pct}%",
+                "ml_confidence": f"{ml_pct}%",
+                "final_confidence": f"{ml_pct}%",
+                "classification_source": "ML",
+                "stability_hash": stability_hash,
+                "model_version": m_version,
+            }
+        return {
+            "document_type": str(pred or "UNKNOWN"),
+            "rule_match_score": f"{rule_pct}%",
+            "ml_confidence": f"{ml_pct}%",
+            "final_confidence": f"{ml_pct}%",
+            "classification_source": "ML",
+            "stability_hash": stability_hash,
+            "model_version": m_version,
+        }
+    except Exception:
+        return {
+            "document_type": "UNKNOWN",
+            "rule_match_score": f"{rule_pct}%",
+            "ml_confidence": "0%",
+            "final_confidence": "0%",
+            "classification_source": "ML",
+            "stability_hash": stability_hash,
+        }
+
+
+def structural_audit_strict(full_text: str, classified_type: Optional[str] = None) -> Dict[str, Any]:
+    text = (full_text or "").strip()
+    lower = text.lower()
+    if not text:
+        return {
+            "document_type": "NOT A LEGAL DOCUMENT",
+            "sections_missing": [],
+            "note": "No legal structural template applicable."
+        }
+
+    non_legal_types = {
+        "Resume", "Invoice", "ID Card", "Driving Licence", "Bank Statement", "Marksheet",
+        "Admit Card", "Transfer Certificate", "Bonafide Certificate", "Other Non Legal Document",
+        "Application Interface Screenshot"
+    }
+
+    detected_raw = (classified_type or classify_document_type(text) or "").strip()
+    detected_norm = classifier.canonicalize_category(detected_raw) if detected_raw else "Other"
+    if detected_norm in non_legal_types:
+        return {
+            "document_type": "NOT A LEGAL DOCUMENT",
+            "sections_missing": [],
+            "note": "No legal structural template applicable."
+        }
+
+    allowed_types = {
+        "Sale Deed",
+        "Lease Deed",
+        "Rental Agreement",
+        "Gift Deed",
+        "Patta",
+        "Encumbrance Certificate",
+        "Court Judgment",
+        "Court Order",
+        "Legal Notice",
+    }
+    doc_type = detected_norm if detected_norm in allowed_types else "Other"
+
+    templates: Dict[str, List[Dict[str, Any]]] = {
+        "Sale Deed": [
+            {"section_name": "Parties (Vendor & Purchaser)", "groups": [["vendor", "seller"], ["purchaser", "buyer"]], "severity": "Critical"},
+            {"section_name": "Property Description (Schedule)", "groups": [["schedule property", "property schedule", "description of property"]], "severity": "Critical"},
+            {"section_name": "Consideration Amount", "groups": [["consideration", "sale consideration", "consideration amount"]], "severity": "Critical"},
+            {"section_name": "Payment Terms", "groups": [["payment", "paid", "mode of payment", "payment terms"]], "severity": "Moderate"},
+            {"section_name": "Registration Details", "groups": [["registered", "registration number", "sub registrar", "doc no"]], "severity": "Critical"},
+            {"section_name": "Witness Section", "groups": [["witness", "witnesses"]], "severity": "Moderate"},
+            {"section_name": "Signature Block", "groups": [["signature", "signed by", "executant"]], "severity": "Critical"},
+        ],
+        "Lease Deed": [
+            {"section_name": "Lessor", "groups": [["lessor", "landlord"]], "severity": "Critical"},
+            {"section_name": "Lessee", "groups": [["lessee", "tenant"]], "severity": "Critical"},
+            {"section_name": "Lease Period", "groups": [["lease period", "term", "duration"]], "severity": "Critical"},
+            {"section_name": "Rent Amount", "groups": [["rent", "monthly rent"]], "severity": "Critical"},
+            {"section_name": "Security Deposit", "groups": [["security deposit", "advance"]], "severity": "Moderate"},
+            {"section_name": "Termination Clause", "groups": [["termination", "terminate", "notice period"]], "severity": "Moderate"},
+            {"section_name": "Dispute Clause", "groups": [["dispute", "arbitration", "jurisdiction"]], "severity": "Moderate"},
+            {"section_name": "Signatures", "groups": [["signature", "signed by"]], "severity": "Critical"},
+        ],
+        "Rental Agreement": [
+            {"section_name": "Landlord", "groups": [["landlord", "owner"]], "severity": "Critical"},
+            {"section_name": "Tenant", "groups": [["tenant"]], "severity": "Critical"},
+            {"section_name": "Rental Term", "groups": [["term", "duration", "period"]], "severity": "Critical"},
+            {"section_name": "Rent Amount", "groups": [["rent", "monthly rent"]], "severity": "Critical"},
+            {"section_name": "Deposit/Advance", "groups": [["security deposit", "advance"]], "severity": "Moderate"},
+            {"section_name": "Termination Clause", "groups": [["termination", "notice period"]], "severity": "Moderate"},
+            {"section_name": "Signatures", "groups": [["signature", "signed by"]], "severity": "Critical"},
+        ],
+        "Gift Deed": [
+            {"section_name": "Gift Declaration", "groups": [["gift deed", "gift"]], "severity": "Critical"},
+            {"section_name": "Donor", "groups": [["donor"]], "severity": "Critical"},
+            {"section_name": "Donee", "groups": [["donee"]], "severity": "Critical"},
+            {"section_name": "Property Description", "groups": [["schedule property", "property schedule", "property"]], "severity": "Critical"},
+            {"section_name": "Registration Details", "groups": [["registered", "sub registrar", "registration number"]], "severity": "Moderate"},
+            {"section_name": "Signature Block", "groups": [["signature", "signed by"]], "severity": "Critical"},
+        ],
+        "Patta": [
+            {"section_name": "Patta Number", "groups": [["patta number"]], "severity": "Critical"},
+            {"section_name": "Survey Number", "groups": [["survey number", "s.no", "tslr"]], "severity": "Critical"},
+            {"section_name": "Village", "groups": [["village"]], "severity": "Critical"},
+            {"section_name": "Taluk", "groups": [["taluk"]], "severity": "Critical"},
+            {"section_name": "District", "groups": [["district"]], "severity": "Moderate"},
+            {"section_name": "Land Owner Name", "groups": [["owner name", "name of pattadar", "pattadar", "holder name"]], "severity": "Critical"},
+            {"section_name": "Revenue Authority Reference", "groups": [["revenue department", "tahsildar", "authority"]], "severity": "Moderate"},
+        ],
+        "Encumbrance Certificate": [
+            {"section_name": "EC Reference Number", "groups": [["ec number", "encumbrance certificate"]], "severity": "Critical"},
+            {"section_name": "Sub-Registrar Details", "groups": [["sub registrar", "sub registrar office", "sro"]], "severity": "Critical"},
+            {"section_name": "Property/Survey Reference", "groups": [["survey number", "property"]], "severity": "Moderate"},
+            {"section_name": "Transaction/Entry Details", "groups": [["encumbrance", "entry", "document number", "registration"]], "severity": "Moderate"},
+        ],
+        "Court Judgment": [
+            {"section_name": "Court Name", "groups": [["in the court of", "high court", "district court", "supreme court"]], "severity": "Critical"},
+            {"section_name": "Case Number", "groups": [["case no", "case number", "w.p.", "c.r.p."]], "severity": "Critical"},
+            {"section_name": "Petitioner", "groups": [["petitioner"]], "severity": "Critical"},
+            {"section_name": "Respondent", "groups": [["respondent"]], "severity": "Critical"},
+            {"section_name": "Date", "groups": [["dated", "pronounced on", "date"]], "severity": "Moderate"},
+            {"section_name": "Judge Name", "groups": [["judge", "justice", "hon'ble"]], "severity": "Moderate"},
+            {"section_name": "Final Judgment Section", "groups": [["judgment", "ordered", "disposed of"]], "severity": "Critical"},
+        ],
+        "Court Order": [
+            {"section_name": "Court Name", "groups": [["in the court of", "high court", "district court", "supreme court"]], "severity": "Critical"},
+            {"section_name": "Case Number", "groups": [["case no", "case number", "w.p.", "c.r.p."]], "severity": "Critical"},
+            {"section_name": "Petitioner", "groups": [["petitioner"]], "severity": "Critical"},
+            {"section_name": "Respondent", "groups": [["respondent"]], "severity": "Critical"},
+            {"section_name": "Date", "groups": [["dated", "date"]], "severity": "Moderate"},
+            {"section_name": "Judge Name", "groups": [["judge", "justice", "hon'ble"]], "severity": "Moderate"},
+            {"section_name": "Final Order Section", "groups": [["order", "it is ordered", "directed"]], "severity": "Critical"},
+        ],
+        "Legal Notice": [
+            {"section_name": "Notice Header", "groups": [["legal notice", "notice"]], "severity": "Critical"},
+            {"section_name": "Sender/Advocate Details", "groups": [["advocate", "counsel", "on behalf of"]], "severity": "Moderate"},
+            {"section_name": "Recipient Details", "groups": [["to,", "addressee", "recipient"]], "severity": "Moderate"},
+            {"section_name": "Cause of Action", "groups": [["cause of action", "breach", "facts"]], "severity": "Critical"},
+            {"section_name": "Demand/Relief", "groups": [["called upon", "demand", "pay", "comply"]], "severity": "Critical"},
+            {"section_name": "Reply Timeline", "groups": [["within", "days", "failing which"]], "severity": "Moderate"},
+            {"section_name": "Signature", "groups": [["signature", "signed"]], "severity": "Critical"},
+        ],
+        "Other": [
+            {"section_name": "Document Header", "groups": [["deed", "agreement", "certificate", "order", "notice"]], "severity": "Moderate"},
+            {"section_name": "Party/Entity Identification", "groups": [["name", "party", "petitioner", "respondent", "vendor", "purchaser"]], "severity": "Moderate"},
+            {"section_name": "Date/Reference Details", "groups": [["date", "reference", "registration", "document number"]], "severity": "Moderate"},
+            {"section_name": "Signature/Authority Block", "groups": [["signature", "signed", "authority", "seal"]], "severity": "Critical"},
+        ],
+    }
+
+    required_sections = templates.get(doc_type, templates["Other"])
+
+    def _status_for_section(section: Dict[str, Any]) -> Tuple[str, int, int]:
+        groups = section.get("groups") or []
+        total_groups = len(groups)
+        matched_groups = 0
+        for group in groups:
+            if any((kw or "").lower() in lower for kw in (group or [])):
+                matched_groups += 1
+        if matched_groups == total_groups and total_groups > 0:
+            return "PRESENT", matched_groups, total_groups
+        if matched_groups > 0:
+            return "PARTIAL", matched_groups, total_groups
+        return "MISSING", matched_groups, total_groups
+
+    sections_missing: List[Dict[str, str]] = []
+    found_count = 0
+    for sec in required_sections:
+        status, matched, total = _status_for_section(sec)
+        if status == "PRESENT":
+            found_count += 1
+        elif status == "PARTIAL":
+            sections_missing.append({
+                "section_name": sec.get("section_name", ""),
+                "severity": sec.get("severity", "Moderate"),
+                "reason": f"Partial match ({matched}/{total}) in document text."
+            })
+        else:
+            sections_missing.append({
+                "section_name": sec.get("section_name", ""),
+                "severity": sec.get("severity", "Moderate"),
+                "reason": "No reliable keywords for this section found in document text."
+            })
+
+    return {
+        "document_type": doc_type,
+        "total_required_sections": str(len(required_sections)),
+        "sections_found": str(found_count),
+        "sections_missing": sections_missing,
+    }
+
+def hybrid_classify_verify(full_text: str, filename: Optional[str] = None) -> Dict[str, Any]:
+    text = (full_text or "").strip()
+    lower = text.lower()
+    if not text:
+        return {
+            "document_name": filename or "",
+            "document_type": "UNKNOWN",
+            "legal_status": "UNKNOWN",
+            "confidence_score": "0%",
+            "risk_level": "LOW",
+            "missing_clauses": [],
+            "reasoning_summary": "No text provided."
+        }
+
+    strong_rules = {
+        "Sale Deed": [
+            "consideration amount", "vendor", "purchaser", "schedule property", "sale deed", "registered at sub registrar"
+        ],
+        "Settlement Deed": [
+            "settlement deed", "settlor", "settlee", "schedule property", "registered at sub registrar"
+        ],
+        "Partition Deed": [
+            "partition deed", "coparceners", "share", "schedule property", "registered at sub registrar"
+        ],
+        "Release Deed": [
+            "release deed", "releasor", "releasee", "relinquish", "schedule property"
+        ],
+        "Rectification Deed": [
+            "rectification deed", "correction", "error in previous deed", "registered at sub registrar"
+        ],
+        "Mortgage Deed": [
+            "mortgage deed", "mortgagor", "mortgagee", "secured loan", "redemption"
+        ],
+        "Power of Attorney": [
+            "power of attorney", "principal", "attorney", "authorized", "to act on behalf"
+        ],
+        "Patta": [
+            "patta number", "taluk", "village", "survey number", "revenue department", "tslr"
+        ],
+        "Lease Deed": [
+            "lessor", "lessee", "lease period", "monthly rent", "security deposit"
+        ],
+        "Rental Agreement": [
+            "rent agreement", "tenant", "landlord", "advance amount"
+        ],
+        "Gift Deed": [
+            "gift deed", "donor", "donee", "out of love and affection"
+        ],
+        "Court Judgment": [
+            "in the court of", "petitioner", "respondent", "order", "judgment"
+        ],
+        "Encumbrance Certificate": [
+            "encumbrance", "sub registrar office", "ec number"
+        ],
+    }
+
+    required_clause_rules = {
+        "Sale Deed": [
+            {"name": "Consideration Clause", "keywords": ["consideration amount", "sale consideration", "consideration"], "critical": True},
+            {"name": "Parties Clause", "keywords": ["vendor", "purchaser"], "critical": True},
+            {"name": "Schedule Property Clause", "keywords": ["schedule property", "property schedule"], "critical": True},
+            {"name": "Registration Clause", "keywords": ["sub registrar", "registered as", "registration number"], "critical": True},
+            {"name": "Signature Clause", "keywords": ["signature", "signed", "witness"], "critical": False},
+        ],
+        "Settlement Deed": [
+            {"name": "Settlement Declaration Clause", "keywords": ["settlement deed", "settlement"], "critical": True},
+            {"name": "Parties Clause", "keywords": ["settlor", "settlee"], "critical": True},
+            {"name": "Schedule Property Clause", "keywords": ["schedule property", "property schedule"], "critical": True},
+            {"name": "Registration Clause", "keywords": ["sub registrar", "registered"], "critical": True},
+            {"name": "Signature Clause", "keywords": ["signature", "signed", "witness"], "critical": False},
+        ],
+        "Partition Deed": [
+            {"name": "Partition Declaration Clause", "keywords": ["partition deed", "partition"], "critical": True},
+            {"name": "Parties Clause", "keywords": ["coparceners", "co-parceners", "parties"], "critical": True},
+            {"name": "Share Allocation Clause", "keywords": ["share", "allotment"], "critical": True},
+            {"name": "Schedule Property Clause", "keywords": ["schedule property", "property schedule"], "critical": True},
+            {"name": "Signature Clause", "keywords": ["signature", "signed", "witness"], "critical": False},
+        ],
+        "Release Deed": [
+            {"name": "Release Declaration Clause", "keywords": ["release deed", "relinquish"], "critical": True},
+            {"name": "Parties Clause", "keywords": ["releasor", "releasee"], "critical": True},
+            {"name": "Property/Right Clause", "keywords": ["schedule property", "rights", "interest"], "critical": True},
+            {"name": "Registration Clause", "keywords": ["sub registrar", "registered"], "critical": False},
+            {"name": "Signature Clause", "keywords": ["signature", "signed", "witness"], "critical": False},
+        ],
+        "Rectification Deed": [
+            {"name": "Rectification Declaration Clause", "keywords": ["rectification deed", "correction deed"], "critical": True},
+            {"name": "Error Reference Clause", "keywords": ["error in previous deed", "typographical error", "mistake"], "critical": True},
+            {"name": "Original Deed Reference Clause", "keywords": ["document no", "registration number", "original deed"], "critical": True},
+            {"name": "Registration Clause", "keywords": ["sub registrar", "registered"], "critical": False},
+        ],
+        "Mortgage Deed": [
+            {"name": "Mortgage Declaration Clause", "keywords": ["mortgage deed", "mortgage"], "critical": True},
+            {"name": "Parties Clause", "keywords": ["mortgagor", "mortgagee"], "critical": True},
+            {"name": "Secured Obligation Clause", "keywords": ["secured loan", "loan amount", "debt"], "critical": True},
+            {"name": "Property Security Clause", "keywords": ["schedule property", "security for repayment"], "critical": True},
+            {"name": "Redemption Clause", "keywords": ["redemption", "redeem"], "critical": False},
+        ],
+        "Power of Attorney": [
+            {"name": "Authorization Clause", "keywords": ["power of attorney", "authorized", "to act on behalf"], "critical": True},
+            {"name": "Parties Clause", "keywords": ["principal", "attorney"], "critical": True},
+            {"name": "Scope of Powers Clause", "keywords": ["powers", "authority", "execute", "represent"], "critical": True},
+            {"name": "Duration/Revocation Clause", "keywords": ["revocation", "valid until", "irrevocable"], "critical": False},
+            {"name": "Signature/Attestation Clause", "keywords": ["signature", "signed", "witness", "notary"], "critical": False},
+        ],
+        "Lease Deed": [
+            {"name": "Parties Clause", "keywords": ["lessor", "lessee"], "critical": True},
+            {"name": "Lease Period Clause", "keywords": ["lease period", "term of lease"], "critical": True},
+            {"name": "Rent Clause", "keywords": ["monthly rent", "rent"], "critical": True},
+            {"name": "Security Deposit Clause", "keywords": ["security deposit", "advance"], "critical": False},
+            {"name": "Signature Clause", "keywords": ["signature", "signed", "witness"], "critical": False},
+        ],
+        "Rental Agreement": [
+            {"name": "Parties Clause", "keywords": ["tenant", "landlord"], "critical": True},
+            {"name": "Rent Clause", "keywords": ["rent agreement", "monthly rent", "rent"], "critical": True},
+            {"name": "Advance Deposit Clause", "keywords": ["advance amount", "security deposit"], "critical": False},
+            {"name": "Term Clause", "keywords": ["period", "term", "duration"], "critical": True},
+            {"name": "Signature Clause", "keywords": ["signature", "signed", "witness"], "critical": False},
+        ],
+        "Gift Deed": [
+            {"name": "Gift Declaration Clause", "keywords": ["gift deed", "out of love and affection"], "critical": True},
+            {"name": "Parties Clause", "keywords": ["donor", "donee"], "critical": True},
+            {"name": "Property Clause", "keywords": ["schedule property", "property"], "critical": True},
+            {"name": "Registration Clause", "keywords": ["sub registrar", "registered"], "critical": False},
+        ],
+        "Patta": [
+            {"name": "Patta Number Clause", "keywords": ["patta number"], "critical": True},
+            {"name": "Location Clause", "keywords": ["taluk", "village"], "critical": True},
+            {"name": "Survey Clause", "keywords": ["survey number", "tslr"], "critical": True},
+            {"name": "Authority Clause", "keywords": ["revenue department", "tahsildar"], "critical": False},
+        ],
+        "Court Judgment": [
+            {"name": "Court Header Clause", "keywords": ["in the court of"], "critical": True},
+            {"name": "Party Clause", "keywords": ["petitioner", "respondent"], "critical": True},
+            {"name": "Judgment Clause", "keywords": ["judgment", "order"], "critical": True},
+            {"name": "Judge Signature Clause", "keywords": ["judge", "pronounced", "signature"], "critical": False},
+        ],
+        "Encumbrance Certificate": [
+            {"name": "EC Identification Clause", "keywords": ["encumbrance", "ec number"], "critical": True},
+            {"name": "Registrar Clause", "keywords": ["sub registrar office", "sub registrar"], "critical": True},
+            {"name": "Property/Survey Clause", "keywords": ["survey number", "property"], "critical": False},
+        ],
+    }
+
+    def _best_rule_match() -> Tuple[Optional[str], float]:
+        best_label = None
+        best_ratio = 0.0
+        for label, keywords in strong_rules.items():
+            hits = sum(1 for kw in keywords if kw in lower)
+            ratio = hits / max(1, len(keywords))
+            if ratio > best_ratio:
+                best_label = label
+                best_ratio = ratio
+        return best_label, best_ratio
+
+    rule_label, rule_ratio = _best_rule_match()
+    ml_used = False
+    ml_pred = None
+    doc_type = "UNKNOWN"
+    confidence_pct = int(round(max(0.0, min(1.0, rule_ratio)) * 100))
+
+    # STEP 1: Rule-based validation. If strong match > 60%, skip ML.
+    if rule_label and rule_ratio > 0.60:
+        doc_type = rule_label
+    else:
+        # STEP 2: ML classification fallback.
+        ml_used = True
+        try:
+            res = classifier.predict_document_type(text)
+            ml_pred, ml_conf = res[0], res[1]
+            ml_conf = float(ml_conf or 0.0)
+            confidence_pct = int(round(max(0.0, min(1.0, ml_conf)) * 100))
+            if ml_conf < 0.40:
+                doc_type = "UNKNOWN"
+            else:
+                doc_type = (ml_pred or "UNKNOWN").strip() or "UNKNOWN"
+        except Exception:
+            doc_type = "UNKNOWN"
+            confidence_pct = max(confidence_pct, 0)
+
+    non_legal_markers = [
+        "resume", "curriculum vitae", "invoice", "proforma invoice", "cover letter", "dear sir", "biodata"
+    ]
+    legal_markers = [
+        "deed", "agreement", "court", "petitioner", "respondent", "patta", "encumbrance", "sub registrar", "judgment"
+    ]
+    non_legal_hits = sum(1 for m in non_legal_markers if m in lower)
+    legal_hits = sum(1 for m in legal_markers if m in lower)
+    non_legal_types = {
+        "resume", "invoice", "id card", "driving licence", "bank statement", "other non legal document", "application interface screenshot"
+    }
+    if (non_legal_hits > 0 and legal_hits == 0) or ((doc_type or "").strip().lower() in non_legal_types and legal_hits == 0):
+        return {
+            "document_name": filename or "",
+            "document_type": "NOT A LEGAL DOCUMENT",
+            "legal_status": "NOT LEGAL",
+            "confidence_score": "95%",
+            "risk_level": "LOW",
+            "missing_clauses": [],
+            "reasoning_summary": "Document does not contain legal property or court-related structure."
+        }
+
+    # STEP 3: AI legal structure validation.
+    structure_checks = {
+        "official_structure": any(k in lower for k in [
+            "whereas", "hereby", "in witness whereof", "this deed", "between", "thereof", "therein"
+        ]),
+        "proper_legal_language": any(k in lower for k in [
+            "hereby", "whereas", "thereof", "witnesseth", "pursuant", "hereinafter"
+        ]),
+        "government_references": any(k in lower for k in [
+            "government", "govt", "department", "sub registrar", "court", "tahsildar", "revenue department"
+        ]),
+        "signature_block": any(k in lower for k in [
+            "signature", "signed by", "signed", "witness"
+        ]),
+        "registration_details": any(k in lower for k in [
+            "registration number", "registered as", "doc no", "document no", "sub registrar", "ec number"
+        ]),
+        "stamp_duty_mention": any(k in lower for k in [
+            "stamp duty", "e-stamp", "stamp paper", "non judicial stamp"
+        ]),
+        "seal_or_authority_mention": any(k in lower for k in [
+            "seal", "authorized signatory", "authority", "notary", "registrar", "tahsildar"
+        ]),
+    }
+    structure_score = sum(1 for v in structure_checks.values() if v)
+    legal_structure_valid = (
+        structure_score >= 4
+        and structure_checks["proper_legal_language"]
+        and (structure_checks["signature_block"] or structure_checks["registration_details"] or structure_checks["seal_or_authority_mention"])
+    )
+    no_legal_structure_detected = structure_score == 0
+    partial_structure = 0 < structure_score < 4
+
+    # Missing clauses by detected type (if applicable).
+    missing_clauses: List[str] = []
+    critical_missing = 0
+    for rule in required_clause_rules.get(doc_type, []):
+        clause_present = any(kw in lower for kw in rule.get("keywords", []))
+        if not clause_present:
+            missing_clauses.append(rule.get("name", "Unknown Clause"))
+            if bool(rule.get("critical")):
+                critical_missing += 1
+
+    # STEP 4: Legal status decision logic.
+    normalized_type = (doc_type or "").strip().lower()
+    type_identified = normalized_type not in {"", "unknown", "not a legal document"}
+    type_mismatch = False
+    if ml_used and rule_label and rule_ratio >= 0.34 and ml_pred:
+        type_mismatch = rule_label.strip().lower() != str(ml_pred).strip().lower()
+
+    legal_status = "UNKNOWN"
+    if type_identified and legal_structure_valid and confidence_pct > 65:
+        legal_status = "LEGAL"
+    elif type_mismatch or confidence_pct < 30 or no_legal_structure_detected:
+        legal_status = "NOT LEGAL"
+    elif partial_structure and len(missing_clauses) > 0:
+        legal_status = "SUSPICIOUS"
+
+    # STEP 5: Risk level.
+    fake_pattern_detected, _ = classifier.detect_fraud(text)
+    if fake_pattern_detected or critical_missing > 0 or len(missing_clauses) > 3:
+        risk_level = "HIGH"
+    elif 1 <= len(missing_clauses) <= 3:
+        risk_level = "MEDIUM"
+    else:
+        risk_level = "LOW"
+
+    source_text = "rule-based" if (rule_label and rule_ratio > 0.60) else "ml-fallback"
+    reasoning_summary = (
+        f"Hybrid flow used {source_text}; structure checks passed: {structure_score}/7; "
+        f"missing clauses: {len(missing_clauses)}."
+    )
+
+    return {
+        "document_name": filename or "",
+        "document_type": doc_type or "UNKNOWN",
+        "legal_status": legal_status,
+        "confidence_score": f"{int(max(0, min(100, confidence_pct)))}%",
+        "risk_level": risk_level,
+        "missing_clauses": missing_clauses,
+        "reasoning_summary": reasoning_summary
+    }
 def extract_indian_entities(full_text: str) -> Dict[str, Any]:
     t = full_text or ""
     lower = t.lower()
@@ -817,6 +1922,27 @@ def extract_indian_entities(full_text: str) -> Dict[str, Any]:
         if r in lower:
             role_parties.append(r)
     property_details = reg_info.get("property_schedule_excerpt")
+    try:
+        tamil_owner_blocks = []
+        owner_patterns = [
+            r"உரிமையாளர்(?:கள்)?\s*பெயர்[^\n]*\n([^\n]+)",
+            r"உரிமையாளர்கள்\s*பெயர்[^\n]*\n([^\n]+)",
+            r"உரிமையாளர்(?:கள்)?\s*[:\-]?\s*([^\n]+)",
+            r"காரியதேயாளர்\s*[:\-]?\s*([^\n]+)",
+        ]
+        for pat in owner_patterns:
+            for m in re.finditer(pat, t):
+                tamil_owner_blocks.append(m.group(1))
+        for block in tamil_owner_blocks:
+            for nm in re.findall(r"([\u0B80-\u0BFF]{2,12}(?:\s+[\u0B80-\u0BFF]{2,12}){0,3})", block):
+                parties.append(transliterate_tamil_to_latin(nm))
+        if not tamil_owner_blocks:
+            context_hits = ("தாலுகா" in t) or ("தாசில்தார்" in t) or ("கிராமம்" in t)
+            if context_hits:
+                for nm in re.findall(r"([\u0B80-\u0BFF]{3,12}(?:\s+[\u0B80-\u0BFF]{3,12}){0,2})", t):
+                    parties.append(transliterate_tamil_to_latin(nm))
+    except Exception:
+        pass
     out = {
         "parties": parties,
         "role_parties": role_parties,
@@ -919,7 +2045,8 @@ def analyze_registration(full_text: str) -> Dict[str, Any]:
         nlp = _get_nlp()
         doc = nlp(full_text)
         parties = list({ent.text for ent in doc.ents if ent.label_ in ["PERSON","ORG"]})[:10]
-    except Exception: pass
+    except Exception as e:
+        print(f"[DEBUG] Registration Document NER failed: {e}")
     missing = []
     if not reg_no: missing.append("Registration Number")
     if not stamp_amount: missing.append("Stamp Duty")
@@ -935,152 +2062,119 @@ def analyze_registration(full_text: str) -> Dict[str, Any]:
         "missing_fields": missing
     }
 
+from backend.app.services.risk_detection_service import risk_detection_service
+
 def clause_risk_detection(full_text: str, translated_text: Optional[str] = None) -> Dict[str, Any]:
     """
-    Enhanced Rule-Based Risk Detection (Replaces LLM)
-    Detects specific high-risk patterns in legal text.
+    Enhanced Hybrid Risk Detection (Rule-based + LegalBERT XAI)
+    Segments document into clauses and analyzes each for risks.
     """
-    text = (translated_text or full_text).lower()
+    text = (translated_text or full_text)
     
-    clauses = []
+    # 1. Use advanced segmentation and LegalBERT analysis
+    try:
+        bert_risk_data = risk_detection_service.detect_all_risks(text)
+        clauses = bert_risk_data.get("clauses", [])
+        overall_risk = bert_risk_data.get("overall_risk", "Low")
+        overall_score = bert_risk_data.get("overall_score", 0)
+    except Exception as e:
+        print(f"[DEBUG] RiskDetectionService failed: {e}")
+        clauses = []
+        overall_risk = "Low"
+        overall_score = 0
+
+    # 2. Rule-based augmentation (Ensuring specific legal keywords are caught)
+    text_lower = text.lower()
     
-    # 1. Termination Risks
-    # Pattern: "without cause" or "convenience" is usually high risk for the other party
-    term_risk = "Low"
-    term_reason = "Standard termination clause."
-    if "termination" in text or "terminate" in text:
-        if "without cause" in text or "for convenience" in text:
-            term_risk = "High"
-            term_reason = "Clause allows termination 'without cause' or 'for convenience'."
-        elif "immediate effect" in text:
-            term_risk = "Medium"
-            term_reason = "Termination with immediate effect found."
-        
-        snippet_idx = text.find("termination")
-        snippet = full_text[snippet_idx:snippet_idx+150] + "..." if snippet_idx != -1 else ""
-        clauses.append({"clause": "Termination", "present": True, "risk": term_risk, "risk_score": 80 if term_risk=="High" else (50 if term_risk=="Medium" else 20), "reason": term_reason, "highlight": snippet})
-    else:
-        clauses.append({"clause": "Termination", "present": False, "risk": "Medium", "risk_score": 50, "reason": "No termination clause found.", "highlight": ""})
+    # If BERT found no clauses, fallback to basic rule-based snippets
+    if not clauses:
+        rules_clauses = []
+        if "termination" in text_lower:
+            rules_clauses.append({"clause": "Termination", "risk": "Medium", "risk_score": 50, "reason": "Termination clause detected via keywords."})
+        if "indemnify" in text_lower:
+            rules_clauses.append({"clause": "Indemnity", "risk": "High", "risk_score": 75, "reason": "Indemnity clause detected via keywords."})
+        clauses = rules_clauses
 
-    # 2. Indemnity
-    # Pattern: "indemnify" without "cap" or "limit" is risky
-    if "indemnify" in text or "indemnification" in text:
-        risk = "Medium"
-        reason = "Indemnity clause present."
-        if "unlimited" in text or "all claims" in text:
-            risk = "High"
-            reason = "Potential unlimited indemnity liability."
-        elif "cap" in text or "limit" in text:
-            risk = "Low"
-            reason = "Indemnity appears to be capped/limited."
-            
-        clauses.append({"clause": "Indemnity", "present": True, "risk": risk, "risk_score": 75 if risk=="High" else 30, "reason": reason, "highlight": "Indemnity clause detected..."})
-    else:
-        clauses.append({"clause": "Indemnity", "present": False, "risk": "Low", "risk_score": 10, "reason": "No indemnity clause (Risk depends on side).", "highlight": ""})
-        
-    # 3. Dispute Resolution
-    if "arbitration" in text:
-        clauses.append({"clause": "Dispute Resolution", "present": True, "risk": "Low", "risk_score": 20, "reason": "Arbitration clause present.", "highlight": "Arbitration..."})
-    elif "court" in text or "jurisdiction" in text:
-        clauses.append({"clause": "Dispute Resolution", "present": True, "risk": "Medium", "risk_score": 40, "reason": "Litigation/Court jurisdiction specified.", "highlight": "Court jurisdiction..."})
-    else:
-        clauses.append({"clause": "Dispute Resolution", "present": False, "risk": "High", "risk_score": 90, "reason": "No dispute resolution mechanism defines.", "highlight": ""})
-
-    # 4. Liability
-    if "limitation of liability" in text or "limit liability" in text:
-        clauses.append({"clause": "Liability", "present": True, "risk": "Low", "risk_score": 20, "reason": "Liability limitation present.", "highlight": "Limitation of Liability..."})
-    else:
-        clauses.append({"clause": "Liability", "present": False, "risk": "High", "risk_score": 85, "reason": "No limitation of liability found (High Risk).", "highlight": ""})
-
-    # 5. Payment
-    pay_present = any(k in text for k in ["payment","consideration","fees","rent"])
-    pay_risk = "Low"
-    pay_reason = "Payment terms present."
-    if pay_present:
-        if "late fee" in text or "interest" in text or "penalty" in text:
-            pay_risk = "Medium"
-            pay_reason = "Late fee/interest/penalty conditions found."
-        if "advance" in text and "non-refundable" in text:
-            pay_risk = "High"
-            pay_reason = "Non-refundable advance detected."
-        clauses.append({"clause":"Payment","present":True,"risk":pay_risk,"risk_score":70 if pay_risk=="High" else (40 if pay_risk=="Medium" else 20),"reason":pay_reason,"highlight":""})
-    else:
-        clauses.append({"clause":"Payment","present":False,"risk":"High","risk_score":85,"reason":"No clear payment/consideration terms.","highlight":""})
-
-    # 6. Ownership
-    own_present = any(k in text for k in ["ownership","title","transfer","conveyance"])
-    own_risk = "Low" if own_present else "High"
-    own_reason = "Ownership or title statements present." if own_present else "Ownership/title statements missing."
-    clauses.append({"clause":"Ownership","present":own_present,"risk":own_risk,"risk_score":80 if own_risk=="High" else 25,"reason":own_reason,"highlight":""})
-
-    # 7. Jurisdiction/Governing Law
-    juris_present = any(k in text for k in ["governing law","jurisdiction","court"])
-    juris_risk = "Low" if juris_present else "Medium"
-    juris_reason = "Jurisdiction/governing law specified." if juris_present else "Jurisdiction/governing law missing."
-    clauses.append({"clause":"Jurisdiction","present":juris_present,"risk":juris_risk,"risk_score":60 if juris_risk=="Medium" else 20,"reason":juris_reason,"highlight":""})
-
-    # 8. Rights & Obligations
-    ro_present = any(k in text for k in ["obligation","obligations","rights","duty"])
-    ro_risk = "Low" if ro_present else "Medium"
-    ro_reason = "Rights/obligations described." if ro_present else "Rights/obligations unclear."
-    clauses.append({"clause":"Rights & Obligations","present":ro_present,"risk":ro_risk,"risk_score":55 if ro_risk=="Medium" else 20,"reason":ro_reason,"highlight":""})
-
-    # 9. Penalties
-    pen_present = any(k in text for k in ["penalty","fine","liquidated damages","ld"])
-    pen_risk = "Medium" if pen_present else "Low"
-    pen_reason = "Penalty/LD present." if pen_present else "No explicit penalties."
-    clauses.append({"clause":"Penalties","present":pen_present,"risk":pen_risk,"risk_score":45 if pen_risk=="Medium" else 15,"reason":pen_reason,"highlight":""})
-
-    # Calculate Overall
-    total_score = sum(c["risk_score"] for c in clauses)
-    avg_score = total_score / max(1, len(clauses))
-    
-    overall_risk = "Low"
-    if avg_score > 40: overall_risk = "Medium"
-    if avg_score > 70: overall_risk = "High"
-    
-    missing = [c["clause"] for c in clauses if not c["present"]]
+    missing = [c for c in ["Termination", "Indemnity", "Liability", "Payment"] if c.lower() not in text_lower]
 
     return {
+        "overall_risk": overall_risk,
+        "overall_score": overall_score,
         "clauses": clauses,
-        "overall_risk": overall_risk, 
-        "overall_risk_score": int(avg_score), 
-        "jurisdiction": "Inferred (Rule-Based)", 
-        "missing_mandatory_fields": missing
+        "missing_mandatory_fields": missing,
+        "metadata": {
+            "engine": "Hybrid (LegalBERT + Rules)",
+            "version": "2.0.0"
+        }
     }
 
 async def clause_risk_detection_async(full_text: str, translated_text: Optional[str] = None) -> Dict[str, Any]:
     return await asyncio.to_thread(clause_risk_detection, full_text, translated_text)
 
 def llm_risk_validation(full_text: str) -> Dict[str, Any]:
-    """
-    Delegate to Regex risk detection (Mocking the LLM validation structure)
-    """
-    risk_data = clause_risk_detection(full_text)
+    text = full_text or ""
+    risk_data = clause_risk_detection(text)
+    mand = check_mandatory_fields(text)
+    curated = curated_jurisdiction_templates(text)
+    issues = [c.get("reason") for c in (risk_data.get("clauses") or []) if (c or {}).get("risk") == "High" and (c or {}).get("reason")]
+    for m in (mand.get("missing") or []):
+        issues.append(f"Missing mandatory field: {m}")
+    for chk in (curated.get("checks") or []):
+        if (chk or {}).get("status") == "fail":
+            rule_name = (chk or {}).get("rule") or "Unknown Check"
+            issues.append(f"Jurisdiction check failed: {rule_name}")
+    base_conf = 85
+    if len(text.strip()) < 200:
+        base_conf = max(50, base_conf - 15)
+    base_conf = max(0, min(100, base_conf - min(20, 5 * len([x for x in issues if str(x).startswith('Missing mandatory field:')]))))
+    level = risk_data.get("overall_risk") or "Unknown"
+    if any((chk or {}).get("status") == "fail" for chk in (curated.get("checks") or [])) or len(mand.get("missing") or []) >= 3:
+        level = "High"
     return {
-        "risk_level": risk_data["overall_risk"],
-        "issues_found": [c["reason"] for c in risk_data["clauses"] if c["risk"] == "High"],
-        "confidence_score": 85 # Mock confidence for rule-based
+        "risk_level": level,
+        "issues_found": issues,
+        "confidence_score": int(base_conf)
     }
 
 async def llm_risk_validation_async(full_text: str) -> Dict[str, Any]:
     return await asyncio.to_thread(llm_risk_validation, full_text)
 
 def check_mandatory_fields(full_text: str) -> Dict[str, Any]:
-    text = full_text.lower()
-    fields = [
-        ("Governing Law", any(k in text for k in ["governing law","jurisdiction"])),
-        ("Signature", any(k in text for k in ["signature","signed by","authorized signatory"])),
-        ("Effective Date", any(k in text for k in ["effective date","commencement"])),
-        ("Parties", any(k in text for k in ["between","party","parties","agreement made by"])),
-        ("Payment Terms", any(k in text for k in ["payment","consideration","fees","charges"])),
-        ("Termination", "termination" in text),
-        ("Confidentiality", "confidential" in text),
-        ("Dispute Resolution", any(k in text for k in ["arbitration","court","dispute resolution","conciliation"])),
-        ("Liability", "liability" in text),
-        ("Warranty", "warranty" in text),
-    ]
-    return {"missing": [name for name, present in fields if not present], "present": [name for name, present in fields if present]}
+    """
+    Module 9: Clause Presence Checker.
+    Uses Hybrid (Rule-based + Semantic) logic to detect mandatory legal clauses.
+    """
+    try:
+        # 1. Use advanced ClausePresenceService
+        res = clause_presence_service.check_presence(full_text)
+        
+        return {
+            "present": res["present"],
+            "missing": res["missing"],
+            "details": res["details"],
+            "metadata": res["metadata"]
+        }
+    except Exception as e:
+        print(f"[DEBUG] ClausePresenceService failed: {e}")
+        # Fallback to basic keyword matching
+        text = full_text.lower()
+        fields = [
+            ("Governing Law", any(k in text for k in ["governing law","jurisdiction"])),
+            ("Signature", any(k in text for k in ["signature","signed by","authorized signatory"])),
+            ("Effective Date", any(k in text for k in ["effective date","commencement"])),
+            ("Parties", any(k in text for k in ["between","party","parties","agreement made by"])),
+            ("Payment Terms", any(k in text for k in ["payment","consideration","fees","charges"])),
+            ("Termination", "termination" in text),
+            ("Confidentiality", "confidential" in text),
+            ("Dispute Resolution", any(k in text for k in ["arbitration","court","dispute resolution","conciliation"])),
+            ("Liability", "liability" in text),
+            ("Warranty", "warranty" in text),
+        ]
+        return {
+            "missing": [name for name, present in fields if not present], 
+            "present": [name for name, present in fields if present],
+            "metadata": {"engine": "Fallback-Rule-Based"}
+        }
 
 async def check_mandatory_fields_async(full_text: str) -> Dict[str, Any]:
     return await asyncio.to_thread(check_mandatory_fields, full_text)
@@ -1265,17 +2359,49 @@ def derive_legal_status(analytics: Dict[str, Any], ml_verification: Optional[Dic
     present_fields = set(mandatory.get("present") or [])
     missing_fields = set(mandatory.get("missing_fields") or mandatory.get("missing") or [])
     has_ownership_indicators = ("Ownership" in present_fields) or ("property_schedule_excerpt" in mandatory and bool(mandatory.get("property_schedule_excerpt")))
-    property_types = {"Patta", "Sale Deed", "Property Certificate", "Settlement Deed", "Partition Deed", "Release Deed", "Rectification Deed"}
+    property_types = {"Patta", "Sale Deed", "Land Property", "Property Certificate", "Settlement Deed", "Partition Deed", "Release Deed", "Rectification Deed"}
 
-    if marker == "verified" and confidence >= 70:
+    # Empty analytics → Not legal (matches robustness tests)
+    if not analytics:
+        status = "NOT_LEGAL"
+        reason = "Document failed verification thresholds"
+    elif marker == "verified" and confidence >= 70:
         status = "LEGAL"
         reason = "Verified with high confidence"
     elif doc_type in property_types and (is_property_related or has_ownership_indicators):
         status = "LEGAL"
         reason = "Property document with key ownership indicators"
     elif marker in {"unverified", "rejected"}:
-        status = "NEEDS_REVIEW"
-        reason = "Document unverified"
+        _id_types = {
+            "PAN Card",
+            "e-PAN",
+            "Aadhaar Card",
+            "Aadhaar PVC Card",
+            "e-Aadhaar",
+            "Driving Licence",
+            "Passport",
+            "Voter ID",
+            "Ration Card",
+            "GST Certificate",
+            "Birth Certificate",
+            "Death Certificate",
+            "Marriage Certificate",
+            "Income Certificate",
+            "Caste Certificate",
+            "Domicile Certificate",
+            "Salary Certificate",
+            "Experience Certificate",
+            "Bonafide Certificate",
+            "Resume",
+            "Invoice",
+            "Bank Statement",
+        }
+        if doc_type in _id_types:
+            status = "VALID"
+            reason = "Identity/certificate document — valid by type"
+        else:
+            status = "NOT_LEGAL"
+            reason = "Document failed verification thresholds"
     else:
         # Fall back to legality score if strong evidence is present
         if legality >= 55:

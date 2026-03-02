@@ -3,12 +3,17 @@ import os
 import re
 import time
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
 from backend.app.core.config import UPLOAD_FOLDER
+from backend.app.services.trust_safety_service import (
+    PIIDetectionService,
+    FairnessAuditService,
+    AccountabilityService,
+)
 
 router = APIRouter(prefix="/trust-safety", tags=["trust-safety"])
 
@@ -16,9 +21,15 @@ router = APIRouter(prefix="/trust-safety", tags=["trust-safety"])
 TRUST_DIR = os.path.join(UPLOAD_FOLDER, "trust_safety")
 os.makedirs(TRUST_DIR, exist_ok=True)
 
+_pii = PIIDetectionService()
+_fair = FairnessAuditService()
+_acct = AccountabilityService()
 
-class TextInput(BaseModel):
+
+class PrivacyRequest(BaseModel):
     text: str
+    mode: Optional[str] = None
+    doc_id: Optional[str] = None
 
 
 class FeedbackInput(BaseModel):
@@ -27,7 +38,15 @@ class FeedbackInput(BaseModel):
     model_prediction: str = ""
     user_correction: str = ""
     model_confidence: float | None = None
+    feedback_type: str = "correction"
     notes: str = ""
+
+
+class ConfidenceInput(BaseModel):
+    text: Optional[str] = None
+    ml_confidence: Optional[float] = None
+    mode: Optional[str] = None
+    doc_id: Optional[str] = None
 
 
 def _now_iso() -> str:
@@ -171,62 +190,24 @@ async def trust_dashboard():
 
 
 @router.post("/privacy/redact")
-async def privacy_redact(payload: TextInput):
+async def privacy_redact(payload: PrivacyRequest):
     text = payload.text or ""
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text is required")
-    entities = _detect_pii(text)
-    redacted = text
-    # Redact from end to start to preserve offsets.
-    for e in sorted(entities, key=lambda x: x["start"], reverse=True):
-        redacted = redacted[: e["start"]] + f"[{e['label']}]" + redacted[e["end"] :]
-    score_obj = _privacy_score(entities)
-    out = {
-        "original_text": text,
-        "redacted_text": redacted,
-        "entities": entities,
-        **score_obj,
-        "timestamp": _now_iso(),
-    }
-    _write_json("privacy", out)
+    out = _pii.redact(text)
     return out
 
 
 @router.post("/fairness/audit")
-async def fairness_audit():
-    # Current backend does not yet store per-class confusion matrices.
-    # Return a stable baseline structure and persist snapshots for tracking.
-    out = {
-        "overall_metrics": {
-            "accuracy": 0.9,
-            "precision": 0.88,
-            "recall": 0.87,
-            "f1_score": 0.875,
-        },
-        "per_class_metrics": {
-            "Liability": {"precision": 0.9, "recall": 0.89, "f1_score": 0.895, "support": 100},
-            "Payment": {"precision": 0.84, "recall": 0.82, "f1_score": 0.83, "support": 100},
-            "Termination": {"precision": 0.92, "recall": 0.91, "f1_score": 0.915, "support": 100},
-        },
-        "recommendations": [
-            {
-                "type": "info",
-                "message": "Collect additional labeled examples for weaker classes to improve fairness.",
-            }
-        ],
-        "audit_timestamp": _now_iso(),
-    }
-    _write_json("fairness", out)
+async def fairness_audit(mode: Optional[str] = "from_feedback"):
+    out = _fair.run_audit(mode or "from_feedback")
     return out
 
 
 @router.post("/confidence/score")
-async def confidence_score(payload: TextInput):
-    text = payload.text or ""
-    if not text.strip():
-        raise HTTPException(status_code=400, detail="Text is required")
-    conf = _confidence_for_text(text)
-    out = {"text": text[:1000], **conf, "timestamp": _now_iso()}
+async def confidence_score(payload: ConfidenceInput):
+    conf = _acct.confidence_score(text=payload.text, ml_confidence=payload.ml_confidence)
+    out = {"text": (payload.text or "")[:1000], **conf, "timestamp": _now_iso()}
     _write_json("confidence", out)
     return out
 
@@ -239,8 +220,24 @@ async def feedback_collect(payload: FeedbackInput):
         "model_prediction": payload.model_prediction,
         "user_correction": payload.user_correction,
         "model_confidence": payload.model_confidence,
+        "feedback_type": payload.feedback_type,
         "notes": payload.notes,
         "timestamp": _now_iso(),
     }
     fname = _write_json("feedback", out)
     return {"success": True, "feedback_id": out["feedback_id"], "file": fname, "timestamp": out["timestamp"]}
+
+
+@router.get("/audit-trails")
+async def audit_trails():
+    return {"events": _acct.list_audit_trails()}
+
+
+@router.get("/feedback/summary")
+async def feedback_summary():
+    return _acct.summarize_feedback()
+
+
+@router.get("/fairness/reports")
+async def fairness_reports():
+    return {"reports": _fair.list_reports()}

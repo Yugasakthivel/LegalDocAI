@@ -1,15 +1,37 @@
 from fastapi import APIRouter, HTTPException, Form
+from pydantic import BaseModel
 from backend.app.database import documents_collection as collection, db
 from backend.app.core.deps import get_openai_client, get_async_openai_client
 from backend.app.core.config import OPENAI_MODEL
 from backend.app.services import analysis_service
 from backend.app.services.risk_service import compute_combined_risk_index
+from backend.app.routes.pipeline import run_full_pipeline
+from typing import List
 import asyncio
 import time
 import json
 import datetime
 
 router = APIRouter(tags=["analysis"])
+
+
+class HybridClassifyResponse(BaseModel):
+    document_name: str
+    document_type: str
+    legal_status: str
+    confidence_score: str
+    risk_level: str
+    missing_clauses: List[str]
+    reasoning_summary: str
+
+
+class DeterministicClassifyResponse(BaseModel):
+    document_type: str
+    rule_match_score: str
+    ml_confidence: str
+    final_confidence: str
+    classification_source: str
+    stability_hash: str
 
 def _local_explain(corpus: str, doc_type: str = None) -> str:
     label = doc_type or analysis_service.classify_document_type(corpus)
@@ -52,6 +74,30 @@ async def analysis_advanced(text: str = Form(None), doc_id: str = Form(None)):
         corpus = d.get("combined_text","") if d else ""
         filename = d.get("filename") if d else None
         existing_type = (d.get("analytics") or {}).get("document_type") if d else None
+        if corpus.strip():
+            # Reuse central pipeline for consistency with upload/modules/document routes.
+            full = await run_full_pipeline(doc_id)
+            if full.get("error"):
+                raise HTTPException(status_code=400, detail=full.get("error"))
+            analytics = full.get("analytics") or {}
+            total = {
+                "results_summary": full.get("results_summary") or {},
+                "analytics": analytics,
+                "filename": full.get("filename") or filename,
+                "clause_risk": analytics.get("clause_risk") or {},
+                "jurisdiction_ai": analytics.get("jurisdiction_checks") or {},
+                "jurisdiction_curated": analytics.get("jurisdiction_curated") or {},
+                "signer_validation": analytics.get("signer_validation") or {},
+                "registration_analysis": analytics.get("registration_analysis") or {},
+                "verification_ai": {
+                    "marker": analytics.get("verified_marker"),
+                    "ai_confidence": analytics.get("ai_confidence"),
+                },
+                "mandatory_fields": analytics.get("mandatory_fields") or {},
+                "key_facts": {},
+                "humanized_text": analytics.get("summary_simple") or analytics.get("summary") or "",
+            }
+            return {"pipeline": [], "summary": total}
     if not corpus:
         # Instead of 400 error, return empty valid structure to prevent frontend hanging
         return {
@@ -94,7 +140,7 @@ async def analysis_advanced(text: str = Form(None), doc_id: str = Form(None)):
         if isinstance(val, Exception):
             print(f"[ERROR] analysis_advanced: Task {key} failed: {val}")
             # Fallbacks
-            if key == "clause": results_map[key] = {"clauses": [], "overall_risk_score": 50}
+            if key == "clause": results_map[key] = {"clauses": [], "overall_risk_score": 0}
             elif key == "verification": results_map[key] = {"marker": "UNVERIFIED", "ai_confidence": 40}
             elif key == "signers": results_map[key] = {"signers": [], "overall_signer_score": 20}
             elif key == "juris_cur": results_map[key] = {"jurisdiction": None, "checks": [], "overall_compliance_score": 40}
@@ -105,7 +151,7 @@ async def analysis_advanced(text: str = Form(None), doc_id: str = Form(None)):
     # Ensure baseline scores if missing from successful tasks
     if not results_map.get("clause", {}).get("overall_risk_score"):
         if "clause" not in results_map: results_map["clause"] = {}
-        results_map["clause"]["overall_risk_score"] = 50
+        results_map["clause"]["overall_risk_score"] = 0
     
     if not results_map.get("signers", {}).get("overall_signer_score"):
         if "signers" not in results_map: results_map["signers"] = {}
@@ -209,6 +255,59 @@ async def analysis_explain(text: str = Form(None), doc_id: str = Form(None)):
             pass
     return {"explanation": explanation, "document_type": doc_type or await analysis_service.classify_document_type_async(corpus)}
 
+@router.post("/summary/translate")
+async def translate_summary(doc_id: str = Form(...), target_lang: str = Form("English")):
+    d = await asyncio.to_thread(collection.find_one, {"doc_id": doc_id}, {"_id": 0, "combined_text": 1, "analytics": 1})
+    if not d:
+        raise HTTPException(status_code=404, detail="Document not found")
+    an = d.get("analytics") or {}
+    base_text = d.get("combined_text", "") or ""
+    summary = an.get("summary_simple") or an.get("summary") or ""
+    if not summary.strip():
+        summary = analysis_service.summarize_fallback(base_text)
+    translated = await analysis_service.translate_text_simple_async(summary, target_lang)
+    try:
+        await asyncio.to_thread(collection.update_one, {"doc_id": doc_id}, {"$set": {"analytics.summary_translated": {"lang": target_lang, "text": translated}}})
+    except Exception:
+        pass
+    return {"doc_id": doc_id, "summary_translated": {"lang": target_lang, "text": translated}}
+
+@router.post("/hybrid/classify", response_model=HybridClassifyResponse)
+async def hybrid_classify(text: str = Form(None), doc_id: str = Form(None)):
+    corpus = text or ""
+    filename = ""
+    if not corpus and doc_id:
+        d = await asyncio.to_thread(collection.find_one, {"doc_id": doc_id}, {"_id": 0, "combined_text": 1, "filename": 1})
+        if d:
+            corpus = d.get("combined_text", "") or ""
+            filename = d.get("filename") or ""
+    if not corpus:
+        return {
+            "document_name": filename or "",
+            "document_type": "Unknown",
+            "legal_status": "UNKNOWN",
+            "confidence_score": "0%",
+            "risk_level": "LOW",
+            "missing_clauses": [],
+            "reasoning_summary": "No text provided."
+        }
+    out = analysis_service.hybrid_classify_verify(corpus, filename or "")
+    return out
+
+
+@router.post("/deterministic/classify", response_model=DeterministicClassifyResponse)
+async def deterministic_classify(text: str = Form(None), doc_id: str = Form(None)):
+    corpus = text or ""
+    if not corpus and doc_id:
+        d = await asyncio.to_thread(
+            collection.find_one,
+            {"doc_id": doc_id},
+            {"_id": 0, "combined_text": 1, "text": 1},
+        )
+        if d:
+            corpus = (d.get("combined_text") or d.get("text") or "")
+    return analysis_service.deterministic_classify_document(corpus)
+
 @router.post("/risk")
 async def analysis_risk(text: str = Form(None), doc_id: str = Form(None)):
     corpus = text or ""
@@ -225,17 +324,61 @@ async def analysis_risk(text: str = Form(None), doc_id: str = Form(None)):
             pass
     return {"risk": result}
 
+
+@router.post("/structural/audit")
+async def structural_audit(text: str = Form(None), doc_id: str = Form(None)):
+    corpus = text or ""
+    classified_type = None
+    if not corpus and doc_id:
+        d = await asyncio.to_thread(
+            collection.find_one,
+            {"doc_id": doc_id},
+            {"_id": 0, "combined_text": 1, "text": 1, "analytics.document_type": 1},
+        )
+        if d:
+            corpus = (d.get("combined_text") or d.get("text") or "")
+            classified_type = ((d.get("analytics") or {}).get("document_type") if isinstance(d.get("analytics"), dict) else None)
+    if not corpus:
+        return {
+            "document_type": "NOT A LEGAL DOCUMENT",
+            "sections_missing": [],
+            "note": "No legal structural template applicable."
+        }
+
+    result = analysis_service.structural_audit_strict(corpus, classified_type)
+    if doc_id:
+        try:
+            await asyncio.to_thread(
+                collection.update_one,
+                {"doc_id": doc_id},
+                {"$set": {"analytics.structural_audit": result}},
+            )
+        except Exception:
+            pass
+    return result
+
 @router.post("/feedback")
 async def analysis_feedback(doc_id: str = Form(None), tag: str = Form(None), data: str = Form(None)):
-    fb = db["training_feedback"]
+    import time as _time
     payload = {
         "doc_id": doc_id,
         "tag": tag,
         "data": json.loads(data) if data else None,
-        "created_at": datetime.datetime.utcnow()
+        "created_at": datetime.datetime.utcnow().isoformat() + "Z",
     }
     try:
-        await asyncio.to_thread(fb.insert_one, payload)
+        if db is not None:
+            fb = db["training_feedback"]
+            await asyncio.to_thread(fb.insert_one, payload)
+        else:
+            from backend.app.core.config import UPLOAD_FOLDER
+            import os
+            dir_path = os.path.join(UPLOAD_FOLDER, "trust_safety")
+            os.makedirs(dir_path, exist_ok=True)
+            ts_ms = int(_time.time() * 1000)
+            fname = os.path.join(dir_path, f"analysis_feedback_{ts_ms}.json")
+            with open(fname, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save feedback: {e}")
-    return {"status":"ok"}
+    return {"status": "ok"}

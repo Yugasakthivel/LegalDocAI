@@ -1,12 +1,16 @@
-import os
+﻿import os
 import shutil
+import time
+import uuid
+import logging
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Form, UploadFile, File, HTTPException
+from fastapi import FastAPI, Form, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse
 
 from backend.app.routes import router as backend_api_router
+from backend.app.routes.verify import router as verify_router
 from backend.app.core.config import (
     OPENAI_MODEL, MONGO_URI, DB_NAME, TESSERACT_CMD, UPLOAD_FOLDER
 )
@@ -18,6 +22,13 @@ from bson import ObjectId
 
 from backend.app.services.ml_service import classifier
 import json
+
+logger = logging.getLogger("legaldocai")
+if not logger.handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
 
 # Lifespan context manager (replaces deprecated on_event)
 @asynccontextmanager
@@ -79,10 +90,40 @@ async def lifespan(app):
     yield
     # Shutdown
     print("===============================================")
-    print("🛑 LegalDocAI Backend Shutting Down")
+    print("ðŸ›‘ LegalDocAI Backend Shutting Down")
     print("===============================================")
 
-app = FastAPI(title="⚖️ LegalDocAI Backend", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="âš–ï¸ LegalDocAI Backend", version="1.0.0", lifespan=lifespan)
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    request.state.request_id = request_id
+    started = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        duration_ms = (time.perf_counter() - started) * 1000.0
+        logger.exception(
+            "request_failed request_id=%s method=%s path=%s duration_ms=%.2f",
+            request_id,
+            request.method,
+            request.url.path,
+            duration_ms,
+        )
+        raise
+
+    duration_ms = (time.perf_counter() - started) * 1000.0
+    response.headers["X-Request-ID"] = request_id
+    logger.info(
+        "request_completed request_id=%s method=%s path=%s status=%s duration_ms=%.2f",
+        request_id,
+        request.method,
+        request.url.path,
+        response.status_code,
+        duration_ms,
+    )
+    return response
 
 # CORS
 app.add_middleware(
@@ -96,6 +137,7 @@ app.add_middleware(
 
 # Routers
 app.include_router(backend_api_router, prefix="/api")
+app.include_router(verify_router, prefix="/api/verify")
 
 # Static UI
 try:
@@ -124,8 +166,31 @@ except Exception as e:
 
 
 if __name__ == "__main__":
-    import uvicorn, os
+    import socket
+    import uvicorn
+
+    def _find_available_port(host: str, preferred_port: int, max_tries: int = 50) -> int:
+        for candidate in range(preferred_port, preferred_port + max_tries):
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.bind((host, candidate))
+                return candidate
+            except OSError:
+                continue
+            finally:
+                sock.close()
+        raise RuntimeError(f"No free port found in range {preferred_port}-{preferred_port + max_tries - 1}")
+
     host = os.getenv("HOST", "0.0.0.0")
     port = int(os.getenv("PORT", "8000"))
     reload_flag = os.getenv("UVICORN_RELOAD", "false").lower() == "true"
-    uvicorn.run(app, host=host, port=port, reload=reload_flag)
+
+    try:
+        uvicorn.run(app, host=host, port=port, reload=reload_flag)
+    except OSError as e:
+        if getattr(e, "errno", None) in (10048, 98):
+            fallback_port = _find_available_port(host, port + 1)
+            print(f"Port {port} is in use. Starting on fallback port {fallback_port}.")
+            uvicorn.run(app, host=host, port=fallback_port, reload=reload_flag)
+        else:
+            raise

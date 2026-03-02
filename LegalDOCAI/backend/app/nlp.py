@@ -1,7 +1,7 @@
 import re
 import spacy
 import asyncio
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from backend.app.core.deps import get_openai_client, get_async_openai_client, is_openai_ready
 from backend.app.core.config import OPENAI_MODEL
 
@@ -18,25 +18,93 @@ def _get_nlp() -> Optional[spacy.language.Language]:
     return _nlp
 
 def detect_language(text: str) -> str:
-    try:
-        for ch in text:
-            cp = ord(ch)
-            if 0x0B80 <= cp <= 0x0BFF:
-                return "Tamil"
-            if 0x0900 <= cp <= 0x097F:
-                return "Hindi"
-            if 0x0C80 <= cp <= 0x0CFF:
-                return "Kannada"
-            if 0x0C00 <= cp <= 0x0C7F:
-                return "Telugu"
-            if 0x0D00 <= cp <= 0x0D7F:
-                return "Malayalam"
-        return "English" if re.search(r"[A-Za-z]", text) else "Unknown"
-    except Exception:
-        return "Unknown"
+    lang, _ = detect_language_with_confidence(text)
+    return lang
+
+def detect_language_with_confidence(text: str) -> Tuple[str, float]:
+    """
+    Detects language and returns a confidence score based on script density.
+    Handles mixed languages by returning the dominant script.
+    """
+    if not text or not text.strip():
+        return "Unknown", 0.0
+    
+    counts = {
+        "Tamil": 0,
+        "Hindi": 0,
+        "Kannada": 0,
+        "Telugu": 0,
+        "Malayalam": 0,
+        "English": 0
+    }
+    
+    total_relevant = 0
+    for ch in text:
+        cp = ord(ch)
+        if 0x0B80 <= cp <= 0x0BFF:
+            counts["Tamil"] += 1
+            total_relevant += 1
+        elif 0x0900 <= cp <= 0x097F:
+            counts["Hindi"] += 1
+            total_relevant += 1
+        elif 0x0C80 <= cp <= 0x0CFF:
+            counts["Kannada"] += 1
+            total_relevant += 1
+        elif 0x0C00 <= cp <= 0x0C7F:
+            counts["Telugu"] += 1
+            total_relevant += 1
+        elif 0x0D00 <= cp <= 0x0D7F:
+            counts["Malayalam"] += 1
+            total_relevant += 1
+        elif (0x0041 <= cp <= 0x005A) or (0x0061 <= cp <= 0x007A):
+            counts["English"] += 1
+            total_relevant += 1
+            
+    if total_relevant == 0:
+        return "Unknown", 0.0
+        
+    dominant_lang = max(counts, key=counts.get)
+    confidence = counts[dominant_lang] / total_relevant
+    
+    return dominant_lang, confidence
+
+def sentence_safe_chunk(text: str, max_chars: int = 1500) -> List[str]:
+    """
+    Splits text into chunks at sentence boundaries to preserve context.
+    """
+    if not text:
+        return []
+    
+    # Simple regex for sentence boundaries
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current_chunk = ""
+    
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) < max_chars:
+            current_chunk += (" " if current_chunk else "") + sentence
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            
+            # If a single sentence is longer than max_chars, split it by character
+            if len(sentence) > max_chars:
+                for i in range(0, len(sentence), max_chars):
+                    chunks.append(sentence[i:i+max_chars].strip())
+                current_chunk = ""
+            else:
+                current_chunk = sentence
+                
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+        
+    return chunks
 
 import httpx
 import urllib.parse
+from backend.app.services.translation_service import translation_service
+from backend.app.services.ner_service import ner_service
+from backend.app.services.summarization_service import summarization_service
 
 def translate_to_english_mymemory(text: str, src_lang: str = "auto") -> str:
     """Fallback translation using MyMemory API (free, no key required for low volume)."""
@@ -113,7 +181,7 @@ async def translate_to_english_async(text: str, src_lang: Optional[str] = None) 
         if lang == "English" or not text.strip():
             return text
         
-        # Parallelize OpenAI and MyMemory if needed, but for now just optimize OpenAI
+        # 1. OpenAI Path (Cloud, highest quality)
         if is_openai_ready():
             try:
                 # Limit input text to 3000 chars for speed in OpenAI
@@ -133,12 +201,20 @@ async def translate_to_english_async(text: str, src_lang: Optional[str] = None) 
             except Exception as e:
                 print(f"[DEBUG] translate_to_english_async: OpenAI error: {e}")
         
-        # Optimized Async MyMemory fallback
+        # 2. Local MarianMT Path (Local, mid quality, private)
+        # Use sentence-safe chunking for transformer models
+        chunks = sentence_safe_chunk(text, max_chars=1000)
+        try:
+            translated_chunks = await translation_service.translate_batch(chunks, lang, "en")
+            if translated_chunks and any(c != original for c, original in zip(translated_chunks, chunks)):
+                return " ".join(translated_chunks)
+        except Exception as e:
+            print(f"[DEBUG] translate_to_english_async: Local translation failed, trying MyMemory: {e}")
+
+        # 3. MyMemory Path (Cloud Fallback, free)
         async with httpx.AsyncClient(timeout=8.0) as client:
             lang_map = {"Tamil": "ta", "Hindi": "hi", "Kannada": "kn", "Telugu": "te", "Malayalam": "ml"}
             src = lang_map.get(lang, "auto")
-            # Limit total characters for MyMemory to 1500 for speed
-            chunks = [text[i:i+500] for i in range(0, min(len(text), 1500), 500)]
             
             async def fetch_chunk(chunk):
                 try:
@@ -153,10 +229,10 @@ async def translate_to_english_async(text: str, src_lang: Optional[str] = None) 
                     return chunk
 
             # Run MyMemory chunks in parallel
-            translated_chunks = await asyncio.gather(*[fetch_chunk(c) for c in chunks])
+            translated_chunks = await asyncio.gather(*[fetch_chunk(c) for c in chunks[:10]]) # Limit to 10 chunks
             return " ".join(translated_chunks)
     except Exception as e:
-        print(f"[DEBUG] translate_to_english_async: error {e}")
+        print(f"[DEBUG] translate_to_english_async: Global error {e}")
         return text
 
 def correct_ocr_errors(text: str) -> str:
@@ -201,98 +277,80 @@ async def correct_ocr_errors_async(text: str) -> str:
     except Exception:
         return text
 
-def perform_ner(text: str) -> Dict[str, List[str]]:
-    # 1. Try LLM-based extraction first for better accuracy
+def perform_ner(text: str) -> Dict[str, Any]:
+    # 1. Try LLM-based extraction first for high-level names/orgs
     try:
         if not is_openai_ready(): raise RuntimeError("OpenAI not ready")
         prompt = (
-            "Extract all PERSON names and ORGANIZATION names from the text below. "
-            "Return a JSON object with keys 'names' (list of strings) and 'organizations' (list of strings). "
-            "Do not include generic terms like 'Vendor', 'Buyer', 'Company'. Only specific names.\n\n"
+            "Extract all PERSON names, ORGANIZATION names, DATEs, and MONETARY AMOUNTs from the legal text below. "
+            "Return a JSON object with keys: 'names', 'organizations', 'dates', 'money'. "
+            "For 'money', include the full string like 'Rs. 50,000'. "
+            "Do not include generic terms. Only specific entities.\n\n"
             + text[:4000]
         )
         resp = get_openai_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
-            max_tokens=500,
+            max_tokens=800,
             response_format={"type": "json_object"}
         )
         content = resp.choices[0].message.content or "{}"
         import json
-        data = json.loads(content)
-        llm_names = data.get("names", [])
-        llm_orgs = data.get("organizations", [])
+        llm_data = json.loads(content)
     except Exception:
-        llm_names = []
-        llm_orgs = []
+        llm_data = {"names": [], "organizations": [], "dates": [], "money": []}
 
-    # 2. Fallback/Augment with spaCy
+    # 2. Local Legal-BERT NER (Domain Specific)
+    local_ner = ner_service.extract_entities(text)
+    bert_entities = local_ner.get("entities", [])
+    
+    # 3. spaCy Fallback (General entities)
     nlp = _get_nlp()
-    doc = nlp(text)
     spacy_names = []
     spacy_orgs = []
-    for ent in doc.ents:
-        if ent.label_ == "PERSON":
-            spacy_names.append(ent.text)
-        elif ent.label_ == "ORG":
-            spacy_orgs.append(ent.text)
-            
-    # Combine results
-    final_names = list(set(llm_names + spacy_names))
-    final_orgs = list(set(llm_orgs + spacy_orgs))
+    spacy_dates = []
+    spacy_money = []
+    if nlp:
+        doc = nlp(text[:10000])
+        for ent in doc.ents:
+            if ent.label_ == "PERSON": spacy_names.append(ent.text)
+            elif ent.label_ == "ORG": spacy_orgs.append(ent.text)
+            elif ent.label_ == "DATE": spacy_dates.append(ent.text)
+            elif ent.label_ == "MONEY": spacy_money.append(ent.text)
+
+    # 4. Hybrid Fusion & Normalization
+    final_names = list(set(llm_data.get("names", []) + spacy_names + [e["text"] for e in bert_entities if e["label"] == "PERSON"]))
+    final_orgs = list(set(llm_data.get("organizations", []) + spacy_orgs + [e["text"] for e in bert_entities if e["label"] == "ORG"]))
     
-    # Simple cleaning
-    final_names = [n for n in final_names if len(n.strip()) > 2]
-    final_orgs = [n for n in final_orgs if len(n.strip()) > 2]
+    raw_dates = list(set(llm_data.get("dates", []) + spacy_dates + [e["text"] for e in bert_entities if e["label"] == "DATE"]))
+    raw_money = list(set(llm_data.get("money", []) + spacy_money + [e["text"] for e in bert_entities if "MONEY" in e["label"] or "AMOUNT" in e["label"]]))
 
-    return {"names": final_names, "organizations": final_orgs}
+    # Normalization
+    normalized_dates = []
+    for d in raw_dates:
+        norm = ner_service.normalize_date(d)
+        if norm: normalized_dates.append({"original": d, "normalized": norm})
+    
+    normalized_money = []
+    for m in raw_money:
+        norm = ner_service.normalize_money(m)
+        if norm: normalized_money.append({"original": m, "normalized": norm})
 
-async def perform_ner_async(text: str) -> Dict[str, List[str]]:
-    # 1. Try LLM-based extraction first
-    try:
-        if not is_openai_ready(): raise RuntimeError("OpenAI not ready")
-        # Reduced text limit for speed
-        prompt = (
-            "Extract all PERSON names and ORGANIZATION names from the text below. "
-            "Return a JSON object with keys 'names' (list of strings) and 'organizations' (list of strings). "
-            "Do not include generic terms like 'Vendor', 'Buyer', 'Company'. Only specific names.\n\n"
-            + text[:2500]
-        )
-        resp = await get_async_openai_client().chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.0,
-            max_tokens=300,
-            response_format={"type": "json_object"}
-        )
-        content = resp.choices[0].message.content or "{}"
-        import json
-        data = json.loads(content)
-        llm_names = data.get("names", [])
-        llm_orgs = data.get("organizations", [])
-    except Exception:
-        llm_names = []
-        llm_orgs = []
-
-    # 2. Fallback with spaCy (Wrapped in thread for performance)
-    def _spacy_ner():
-        nlp = _get_nlp()
-        if nlp:
-            # Limit text for spaCy too
-            doc = nlp(text[:5000])
-            return [ent.text for ent in doc.ents if ent.label_ == "PERSON"], \
-                   [ent.text for ent in doc.ents if ent.label_ == "ORG"]
-        return [], []
-
-    spacy_names, spacy_orgs = await asyncio.to_thread(_spacy_ner)
-            
-    final_names = list(set(llm_names + spacy_names))
-    final_orgs = list(set(llm_orgs + spacy_orgs))
     return {
         "names": [n for n in final_names if len(n.strip()) > 2],
-        "organizations": [n for n in final_orgs if len(n.strip()) > 2]
+        "organizations": [n for n in final_orgs if len(n.strip()) > 2],
+        "dates": normalized_dates,
+        "money": normalized_money,
+        "metadata": {
+            "model": local_ner.get("model", "spacy/llm"),
+            "version": local_ner.get("version", "1.0.0")
+        }
     }
+
+async def perform_ner_async(text: str) -> Dict[str, Any]:
+    # Wrap sync version for now, or implement async specific logic
+    return await asyncio.to_thread(perform_ner, text)
 
 def extract_clauses(text: str) -> List[str]:
     kws = [
@@ -307,40 +365,45 @@ def extract_clauses(text: str) -> List[str]:
             found.append(kw)
     return list(dict.fromkeys(found))
 
-def legal_summarize(text: str) -> str:
+def legal_summarize(text: str) -> Dict[str, Any]:
+    # 1. Try OpenAI-based extraction first for best abstractive quality
     try:
         if not is_openai_ready(): raise RuntimeError("OpenAI not ready")
-        prompt = "Summarize the following legal text in 3-4 sentences focusing on obligations, risks, and parties:\n\n" + text[:4000]
+        prompt = (
+            "Summarize the following legal text in 3-4 sentences focusing on obligations, risks, and parties. "
+            "Ensure numerical consistency and preserve party names accurately. "
+            "Return a JSON object with keys: 'summary' (string), 'key_points' (list of strings).\n\n"
+            + text[:4000]
+        )
         resp = get_openai_client().chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role":"user","content":prompt}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
-            max_tokens=300
+            max_tokens=500,
+            response_format={"type": "json_object"}
         )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        nlp = _get_nlp()
-        if nlp:
-            doc = nlp(text[:2000])
-            sents = [s.text for s in doc.sents]
-            return " ".join(sents[:3])
-        return "Summary unavailable."
+        import json
+        data = json.loads(resp.choices[0].message.content or "{}")
+        return {
+            "summary": data.get("summary", ""),
+            "key_points": data.get("key_points", []),
+            "method": "OpenAI",
+            "metadata": {"model": OPENAI_MODEL}
+        }
+    except Exception as e:
+        print(f"[DEBUG] OpenAI Summarization failed: {e}")
 
-async def legal_summarize_async(text: str) -> str:
-    try:
-        if not is_openai_ready(): raise RuntimeError("OpenAI not ready")
-        # Limit text for speed
-        prompt = "Summarize the following legal text in 3-4 sentences focusing on obligations, risks, and parties:\n\n" + text[:2500]
-        resp = await get_async_openai_client().chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.2,
-            max_tokens=250
-        )
-        return (resp.choices[0].message.content or "").strip()
-    except Exception:
-        # Fallback to sync version's fallback wrapped in thread
-        return await asyncio.to_thread(legal_summarize, text)
+    # 2. Fallback to Local Summarization Service (Map-Reduce / TextRank)
+    res = summarization_service.summarize_chunked(text)
+    return {
+        "summary": res["summary"],
+        "key_points": [], # Local model is purely abstractive/extractive
+        "method": res["method"],
+        "metadata": res.get("metadata", {})
+    }
+
+async def legal_summarize_async(text: str) -> Dict[str, Any]:
+    return await asyncio.to_thread(legal_summarize, text)
 
 def process_text_pipeline(text: str) -> Dict[str, Any]:
     language = detect_language(text)

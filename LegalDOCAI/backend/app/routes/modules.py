@@ -13,7 +13,19 @@ from backend.app.services.storage_service import create_initial_document, get_do
 from backend.app.vectorstore import add_document, fetch_document_by_id, search_doc_first
 from backend.app.core.config import UPLOAD_FOLDER
 from backend.app.core.deps import get_current_user, is_openai_ready
+from backend.app.routes.pipeline import run_full_pipeline
+from backend.app.services.offline_rag_service import get_rag_mode, generate_answer_offline
+import backend.app.vectorstore as vectorstore
+from backend.app.services.indian_legal_verifier import IndianLegalVerifier
+import asyncio
 
+try:
+    from backend.app.services.trust_safety_service import PIIDetectionService, AccountabilityService
+    _pii = PIIDetectionService()
+    _acct = AccountabilityService()
+except Exception:
+    _pii = None
+    _acct = None
 # Optional deps for Module 1 forensic checks
 try:
     import cv2
@@ -185,6 +197,15 @@ async def module_ingest(file: UploadFile = File(...), ocr_lang: str = Form("auto
         payload["is_indian_legal_document"] = bool(two_step.get("is_indian"))
     except Exception:
         pass
+    try:
+        if _pii:
+            pii = _pii.audit_compliance(combined_text[:10000])
+            save_document(doc_id, {"analytics.pii_summary": pii})
+            payload["pii_summary"] = pii
+        if _acct:
+            _acct.log_event(doc_id, "M1_Ingest", "pii_scan", decision="completed", details={"size_bytes": metadata.get("size_bytes")})
+    except Exception:
+        pass
     # Do not delete temp_path immediately if used as clean_file
     try:
         if clean_file != temp_path:
@@ -205,14 +226,21 @@ async def module_ocr(doc_id: str = Form(...)):
     if not text:
         raise HTTPException(status_code=400, detail="Document has no extracted text")
 
-    # Basic layout grouping via detected clause headings
+    # Enhanced layout grouping
     headings = analysis_service.detect_clause_headings(text)
+    structured_layout = analysis_service.extract_structured_layout(text)
+    
     out = {
         "doc_id": doc_id,
         "extracted_text": text,
-        "layout": {"headings": headings},
+        "layout": {
+            "headings": headings,
+            "structured_layout": structured_layout,
+            "page_count": len(doc.get("pages") or [])
+        },
     }
-    _update_pipeline(doc_id, "ocr", {"pages": len(doc.get("pages") or []), "layout": out["layout"]})
+    _update_pipeline(doc_id, "ocr", {"pages": out["layout"]["page_count"], "layout": out["layout"]})
+    save_document(doc_id, {"analytics.layout": out["layout"]})
     return JSONResponse(out)
 
 
@@ -223,13 +251,25 @@ async def module_language(doc_id: str = Form(...)):
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
     text = doc.get("combined_text") or ""
-    lang = ocr_service.detect_language_simple(text)
+    lang = analysis_service.detect_language(text[:4000])
 
-    # Placeholder translation: for now, pass through text. Hook MarianMT or API later.
     normalized_text = text
+    translation_triggered = False
+    if lang and lang != "English":
+        try:
+            normalized_text = await analysis_service.translate_to_english_async(text[:6000], lang)
+            translation_triggered = True
+        except Exception as e:
+            print(f"[DEBUG] module_language translation failed: {e}")
 
-    out = {"doc_id": doc_id, "language": lang, "normalized_text": normalized_text}
+    out = {
+        "doc_id": doc_id, 
+        "language": lang, 
+        "normalized_text": normalized_text,
+        "translation_triggered": translation_triggered
+    }
     _update_pipeline(doc_id, "lang", out)
+    save_document(doc_id, {"analytics.detected_language": lang})
     return JSONResponse(out)
 
 
@@ -244,6 +284,11 @@ async def module_classify(doc_id: str = Form(...)):
     out = {"doc_id": doc_id, "document_type": doc_type, "confidence": None}
     _update_pipeline(doc_id, "classify", out)
     save_document(doc_id, {"analytics.document_type": doc_type})
+    try:
+        if _acct:
+            _acct.log_event(doc_id, "M4_Classify", "classification", decision=doc_type, details={})
+    except Exception:
+        pass
     return JSONResponse(out)
 
 
@@ -258,13 +303,23 @@ async def module_ner(doc_id: str = Form(...)):
     extra = analysis_service.extract_indian_entities(working_text or text)
     entities = results.get("entities", {}) if isinstance(results, dict) else {}
     contact_info = results.get("contact_info", {}) if isinstance(results, dict) else {}
+    phones_raw = contact_info.get("phones", []) if isinstance(contact_info, dict) else []
+    phones = []
+    for p in (phones_raw or []):
+        if isinstance(p, dict):
+            val = p.get("normalized") or p.get("number")
+            if val:
+                phones.append(str(val))
+        elif p:
+            phones.append(str(p))
+    phones = list(dict.fromkeys(phones))
     out = {
         "doc_id": doc_id,
         "entities": {
             "names": entities.get("names", []),
             "organizations": entities.get("organizations", []),
             "emails": contact_info.get("emails", []),
-            "phones": contact_info.get("phones", []),
+            "phones": phones,
             "dates": results.get("dates", []),
             "signers": results.get("signers", []),
             "parties": extra.get("parties", []),
@@ -292,7 +347,8 @@ async def module_clauses(doc_id: str = Form(...)):
         raise HTTPException(status_code=404, detail="Document not found")
     text = doc.get("combined_text") or ""
     clause = analysis_service.clause_risk_detection(text)
-    checklist = mandatory_fields(text)
+    doc_type = (doc.get("analytics", {}) or {}).get("document_type") or analysis_service.classify_document_type(text)
+    checklist = mandatory_fields(text, doc_type)
     out = {"doc_id": doc_id, "clause_risk": clause, "checklist": checklist}
     _update_pipeline(doc_id, "clauses", out)
     save_document(doc_id, {"analytics.clause_risk": clause, "analytics.mandatory_fields": checklist})
@@ -312,6 +368,12 @@ async def module_risk(doc_id: str = Form(...)):
     out = {"doc_id": doc_id, "risk": clause, "jurisdiction_ai": juris_ai, "jurisdiction_curated": juris_cur}
     _update_pipeline(doc_id, "risk", out)
     save_document(doc_id, {"analytics.clause_risk": clause, "analytics.jurisdiction_checks": juris_ai, "analytics.jurisdiction_curated": juris_cur})
+    try:
+        if _acct:
+            overall = (clause or {}).get("overall_risk")
+            _acct.log_event(doc_id, "M7_Risk", "risk_detection", decision=overall, details={"risk_score": (clause or {}).get("overall_risk_score")})
+    except Exception:
+        pass
     return JSONResponse(out)
 
 
@@ -348,17 +410,71 @@ async def module_timeline(doc_id: str = Form(...)):
 async def module_rag_query(doc_id: str = Form(...), question: str = Form(...), user: dict = Depends(get_current_user)):
     if not question:
         raise HTTPException(status_code=400, detail="Question required")
-    if not _openai_configured():
-        return JSONResponse({"error": "OpenAI not configured", "code": "OPENAI_NOT_CONFIGURED"}, status_code=503)
-    # Ensure document is indexed
     doc = fetch_document_by_id(doc_id) or get_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="Document not found")
+    mode_cfg = get_rag_mode()
+    openai_ready = _openai_configured()
+    text = (doc.get("combined_text") or doc.get("text") or "")
+    if (mode_cfg == "local") or (not openai_ready):
+        a = doc.get("analytics") or {}
+        a = {**a, "filename": doc.get("filename")}
+        data = generate_answer_offline(question, text, a)
+        return JSONResponse({
+            "doc_id": doc_id,
+            "answer": data.get("answer") or "",
+            "source": data.get("source") or "offline_rag",
+            "chunks_used": data.get("chunks_used") or 0,
+            "confidence": data.get("confidence"),
+            "mode": "offline",
+        })
     if doc and (doc.get("combined_text") or doc.get("text")):
         try:
             add_document({"doc_id": doc_id, "filename": doc.get("filename"), "combined_text": doc.get("combined_text") or doc.get("text")})
         except Exception:
             pass
     sources = search_doc_first(question, doc_id, top_k=3) or []
-    return JSONResponse({"doc_id": doc_id, "answers": sources})
+    context = (doc.get("combined_text") or doc.get("text") or "")[:15000]
+    try:
+        answer = await asyncio.to_thread(analysis_service.answer_with_fallback, question, context)
+        return JSONResponse({
+            "doc_id": doc_id,
+            "answer": answer or "",
+            "source": "openai_rag",
+            "chunks_used": len(sources),
+            "confidence": None,
+            "mode": "openai",
+        })
+    except Exception:
+        data = generate_answer_offline(question, text, {})
+        return JSONResponse({
+            "doc_id": doc_id,
+            "answer": data.get("answer") or "",
+            "source": data.get("source") or "offline_rag",
+            "chunks_used": data.get("chunks_used") or 0,
+            "confidence": data.get("confidence"),
+            "mode": "offline",
+        })
+
+@router.get("/rag/status")
+async def rag_status(user: dict = Depends(get_current_user)):
+    mode_cfg = get_rag_mode()
+    openai_ready = _openai_configured()
+    local_ready = bool(getattr(vectorstore, "_fe_pipeline", None))
+    model_name = os.environ.get("LOCAL_EMBEDDING_MODEL") or getattr(vectorstore, "_fe_model_name", "")
+    if mode_cfg == "local":
+        active = "offline"
+    elif openai_ready and mode_cfg in {"openai", "auto"}:
+        active = "openai"
+    else:
+        active = "offline"
+    return JSONResponse({
+        "active_mode": active,
+        "configured_mode": mode_cfg,
+        "openai_ready": bool(openai_ready),
+        "local_embed_ready": bool(local_ready),
+        "model_name": model_name,
+    })
 
 
 # MODULE 11 – Document Comparison (file or text)
@@ -371,6 +487,10 @@ async def module_compare(
     ocr_engine: str = Form(None),
     user: dict = Depends(get_current_user)
 ):
+    import difflib
+    from backend.app.core.deps import get_openai_client
+    from backend.app.core.config import OPENAI_MODEL
+
     doc = fetch_document_by_id(doc_id) or get_document(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
@@ -395,11 +515,49 @@ async def module_compare(
     if not other:
         return JSONResponse({"doc_id": doc_id, "diff": {"removed": [], "added": []}, "note": "Provide other_text or other_file"})
 
-    base_sents = [s.strip() for s in base.split("\n") if s.strip()]
-    other_sents = [s.strip() for s in other.split("\n") if s.strip()]
-    removed = [s for s in base_sents if s not in other_sents]
-    added = [s for s in other_sents if s not in base_sents]
-    return JSONResponse({"doc_id": doc_id, "diff": {"removed": removed[:200], "added": added[:200]}})
+    # 1. Structural Diff
+    d = difflib.unified_diff(base.splitlines(), other.splitlines(), lineterm="")
+    diff_lines = list(d)
+    added = [l[1:].strip() for l in diff_lines if l.startswith("+") and not l.startswith("+++")]
+    removed = [l[1:].strip() for l in diff_lines if l.startswith("-") and not l.startswith("---")]
+
+    # 2. Semantic Analysis (if LLM is ready)
+    semantic_report = {}
+    if is_openai_ready():
+        try:
+            prompt = (
+                "Compare these two legal document excerpts.\n"
+                "Focus on critical differences: Parties, Dates, Payment, Property Details.\n"
+                "Return JSON with keys: 'critical_differences' (list), 'summary' (string).\n\n"
+                "DOC 1:\n" + base[:2000] + "\n\nDOC 2:\n" + other[:2000]
+            )
+            client = get_openai_client()
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=500
+            )
+            raw = resp.choices[0].message.content or ""
+            start = raw.find("{")
+            end = raw.rfind("}") + 1
+            if start != -1 and end > start:
+                semantic_report = json.loads(raw[start:end])
+        except Exception as e:
+            print(f"[DEBUG] module_compare semantic analysis failed: {e}")
+
+    out = {
+        "doc_id": doc_id,
+        "structural_diff": {
+            "added_count": len(added),
+            "removed_count": len(removed),
+            "added_samples": added[:100],
+            "removed_samples": removed[:100],
+        },
+        "semantic_report": semantic_report
+    }
+    _update_pipeline(doc_id, "compare", out)
+    return JSONResponse(out)
 
 
 # MODULE 12 – Report Generation (JSON placeholder)
@@ -432,6 +590,18 @@ async def module_report(
         "entities": results,
         "timeline": analytics.get("timeline", []),
     }
+    try:
+        vr = analytics.get("verification_report")
+        if not vr:
+            _verifier = IndianLegalVerifier()
+            text = (doc.get("combined_text") or doc.get("text") or "")
+            try:
+                vr = _verifier.verify(text)
+            except Exception as e:
+                vr = {"error": str(e)}
+        report["verification_report"] = vr
+    except Exception as e:
+        report["verification_report"] = {"error": str(e)}
     return JSONResponse(report)
 
 def _legal_doc_confidence(text: str, stats: Dict[str, Any], doc_type: str = None) -> int:
@@ -453,84 +623,14 @@ def _legal_doc_confidence(text: str, stats: Dict[str, Any], doc_type: str = None
 # One-shot pipeline orchestrator for the new method
 @router.post("/pipeline/new_full")
 async def pipeline_new_full(doc_id: str = Form(...), user: dict = Depends(get_current_user)):
-    # This assumes ingest already saved combined_text. If not, we just operate on existing doc.
+    # Use the central full pipeline so all routes produce identical outputs/shapes.
     doc = fetch_document_by_id(doc_id) or get_document(doc_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Document not found")
-
-    text = doc.get("combined_text") or ""
-    if not text:
+    if not (doc.get("combined_text") or "").strip():
         raise HTTPException(status_code=400, detail="No text available for analysis")
 
-    # Helper to extract JSON from JSONResponse
-    def extract_json(response):
-        if isinstance(response, JSONResponse):
-            import json
-            return json.loads(response.body.decode())
-        return response if isinstance(response, dict) else {}
-
-    # Classification first (for UI step)
-    try:
-        cls_out = await module_classify(doc_id)
-        cls_data = extract_json(cls_out)
-        doc_type = cls_data.get("document_type")
-    except Exception:
-        doc_type = None
-
-    # Core modules
-    ner_out = await module_ner(doc_id)
-    clauses_out = await module_clauses(doc_id)
-    risk_out = await module_risk(doc_id)
-    tl_out = await module_timeline(doc_id)
-
-    # Extract JSON from responses
-    ner_data = extract_json(ner_out)
-    clauses_data = extract_json(clauses_out)
-    risk_data = extract_json(risk_out)
-    tl_data = extract_json(tl_out)
-
-    # Verification + signer validation
-    try:
-        verification = verify_document(text)
-        signers_found = ner_data.get("entities", {}).get("signers", [])
-        signer_validation = validate_signers(text, signers_found)
-    except Exception:
-        verification = {"marker": None, "ai_confidence": None}
-        signer_validation = {}
-
-    # Combine into analytics & compute final score
-    analytics = ner_data.get("stats", {})
-    analytics.update({
-        "document_type": doc_type,
-        "clause_risk": clauses_data.get("clause_risk"),
-        "jurisdiction_checks": risk_data.get("jurisdiction_ai"),
-        "jurisdiction_curated": risk_data.get("jurisdiction_curated"),
-        "timeline": tl_data.get("timeline"),
-        "verified_marker": verification.get("marker"),
-        "ai_confidence": verification.get("ai_confidence"),
-        "signer_validation": signer_validation
-    })
-
-    try:
-        from backend.app.services.risk_service import compute_combined_risk_index
-        analytics["combined_risk_index"] = compute_combined_risk_index(analytics)
-    except Exception:
-        pass
-
-    # Index for intelligent search (RAG)
-    try:
-        add_document({"doc_id": doc_id, "filename": doc.get("filename"), "combined_text": text})
-    except Exception:
-        pass
-
-    try:
-        analytics["legal_document_confidence"] = _legal_doc_confidence(text, analytics, doc_type)
-    except Exception:
-        pass
-    save_document(doc_id, {"analytics": analytics})
-
-    return JSONResponse({
-        "doc_id": doc_id,
-        "analytics": analytics,
-        "results_summary": ner_data.get("entities", {}),
-    })
+    result = await run_full_pipeline(doc_id)
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result.get("error"))
+    return JSONResponse(result)

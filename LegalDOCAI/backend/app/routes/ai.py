@@ -14,8 +14,8 @@ import os
 import shutil
 import uuid
 import asyncio
-from typing import Optional
-_prefer_local_translation = os.getenv("USE_LOCAL_TRANSLATION_FIRST", "0").strip() == "1"
+from backend.app.services.translation_service import translation_service
+from backend.app.nlp import sentence_safe_chunk, detect_language_with_confidence
 
 router = APIRouter(tags=["ai"])
 
@@ -125,43 +125,173 @@ async def ai_response(req: AIRequest, user: dict = Depends(get_current_user)):
 
 @router.post("/chat-rag")
 async def chat_rag(doc_id: str, question: str, user: dict = Depends(get_current_user)):
-    if not doc_id or not question:
-        raise HTTPException(status_code=400, detail="doc_id and question are required.")
-    doc = collection.find_one({"doc_id": doc_id}, {"_id": 0, "combined_text": 1, "filename": 1})
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found.")
-    
-    # Ensure document is indexed
-    if doc.get("combined_text"):
-        vectorstore.add_document({"doc_id": doc_id, "filename": doc.get("filename",""), "combined_text": doc["combined_text"]})
-        
-    retrieved = vectorstore.search_doc_first(question, doc_id, top_k=3)
-    contexts = []
-    for r in (retrieved or []):
-        d_res = collection.find_one({"doc_id": r.get("doc_id")}, {"_id": 0, "combined_text": 1})
-        if d_res and d_res.get("combined_text"):
-            contexts.append(d_res["combined_text"][:2000])
-            
-    context_blob = "\n\n".join(contexts) if contexts else doc.get("combined_text","")[:2000]
-    try:
-        prompt = (
-            "Answer the question using the provided document context. "
-            "Cite relevant snippets. If not found, say not explicitly stated.\n\n"
-            "Context:\n" + context_blob + "\n\nQuestion:\n" + question
-        )
-        resp = get_openai_client().chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[{"role":"user","content":prompt}],
-            temperature=0.1,
-            max_tokens=600
-        )
-        answer = resp.choices[0].message.content
-    except Exception as e:
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required.")
+
+    def _is_low_confidence_answer(ans: str) -> bool:
+        a = (ans or "").strip().lower()
+        if not a:
+            return True
+        weak_signals = [
+            "not available in the document",
+            "not explicitly stated",
+            "not found",
+            "document not found",
+            "no text content",
+        ]
+        return any(s in a for s in weak_signals)
+
+    def _ai_fallback_answer() -> str:
+        # Last-resort answer path when both doc fetch and RAG retrieval fail.
         try:
-            answer = analysis_service.answer_with_fallback(question, context_blob)
+            prompt = (
+                "No matching document context was found for the user query.\n"
+                "Answer in 3-5 lines with clear guidance and explicitly mention that "
+                "no document match was found.\n\nUser question:\n" + question
+            )
+            resp = get_openai_client().chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.2,
+                max_tokens=300,
+            )
+            return (resp.choices[0].message.content or "").strip()
         except Exception:
-            answer = f"Failed to answer: {e}"
-    return {"answer": answer, "sources": retrieved or []}
+            return (
+                "No matching document content was found. "
+                "Please upload/select the correct document or ask a broader question."
+            )
+
+    def _heuristic_legal_answer(q: str, context_blob: str) -> str:
+        ql = (q or "").lower()
+        ctx = context_blob or ""
+        if not ctx.strip():
+            return ""
+        # Common contract wording: "between <A> and <B>"
+        if "parties" in ql or "party" in ql or "owner" in ql:
+            m = re.search(
+                r"\bbetween\s+([A-Z][A-Za-z\.\s]{1,60}?)\s+and\s+([A-Z][A-Za-z\.\s]{1,60}?)(?:[\,\.\n]|$)",
+                ctx,
+            )
+            if m:
+                a = (m.group(1) or "").strip()
+                b = (m.group(2) or "").strip()
+                if "owner" in ql:
+                    return f"Owner appears to be {a}."
+                return f"The parties appear to be {a} and {b}."
+        if "owner" in ql:
+            m = re.search(r"\bowner(?:\s*name)?\s*[:\-]\s*([A-Z][A-Za-z\.\s]{1,80})", ctx, flags=re.IGNORECASE)
+            if m:
+                return f"Owner appears to be {(m.group(1) or '').strip()}."
+        return ""
+
+    def _answer_from_context(context_blob: str) -> str:
+        # Fast path first: deterministic methods are both quicker and often
+        # more stable for direct extraction questions.
+        heuristic = _heuristic_legal_answer(question, context_blob or "")
+        if not _is_low_confidence_answer(heuristic):
+            return heuristic
+
+        rule_based = analysis_service.answer_with_fallback(question, context_blob or "")
+        if not _is_low_confidence_answer(rule_based):
+            return rule_based
+
+        # Only call OpenAI when deterministic paths are weak.
+        if not is_openai_ready():
+            return rule_based
+        try:
+            prompt = (
+                "Answer the question using only the context. "
+                "If context does not contain the answer, reply exactly: Not available in the document.\n\n"
+                "Context:\n" + (context_blob or "")[:8000] + "\n\nQuestion:\n" + question
+            )
+            resp = get_openai_client().chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+                max_tokens=300,
+            )
+            return (resp.choices[0].message.content or "").strip()
+        except Exception:
+            return rule_based
+
+    doc = collection.find_one({"doc_id": doc_id}, {"_id": 0, "combined_text": 1, "text": 1, "filename": 1}) if doc_id else None
+    doc_found = bool(doc)
+
+    # 1) Primary path: doc-first RAG
+    doc_sources: List[Dict[str, Any]] = []
+    doc_text = (doc or {}).get("combined_text") or (doc or {}).get("text") or ""
+    if doc and doc_text:
+        try:
+            vectorstore.add_document({"doc_id": doc_id, "filename": doc.get("filename", ""), "combined_text": doc_text})
+        except Exception:
+            pass
+        try:
+            doc_sources = vectorstore.search_doc_first(question, doc_id, top_k=3) or []
+        except Exception:
+            doc_sources = []
+
+        contexts: List[str] = []
+        for hit in doc_sources:
+            d_res = collection.find_one({"doc_id": hit.get("doc_id")}, {"_id": 0, "combined_text": 1, "text": 1})
+            txt = (d_res or {}).get("combined_text") or (d_res or {}).get("text") or ""
+            if txt:
+                contexts.append(txt[:2000])
+
+        # Fallback to full selected doc text if retrieval is weak
+        doc_context = "\n\n".join(contexts) if contexts else (doc_text[:2500])
+        if doc_context:
+            doc_answer = _answer_from_context(doc_context)
+            if not _is_low_confidence_answer(doc_answer):
+                return {
+                    "answer": doc_answer,
+                    "sources": doc_sources,
+                    "mode": "rag_doc",
+                    "fallback_used": False,
+                    "doc_found": doc_found,
+                    "message": "Answered from selected document context.",
+                }
+
+    # 2) Fallback path: global RAG search across indexed docs
+    global_sources: List[Dict[str, Any]] = []
+    try:
+        global_sources = vectorstore.search(question, top_k=5) or []
+    except Exception:
+        global_sources = []
+
+    global_contexts: List[str] = []
+    for hit in global_sources:
+        did = hit.get("doc_id")
+        if not did:
+            continue
+        d_res = vectorstore.fetch_document_by_id(did) or collection.find_one({"doc_id": did}, {"_id": 0, "combined_text": 1, "text": 1})
+        txt = (d_res or {}).get("combined_text") or (d_res or {}).get("text") or ""
+        if txt:
+            global_contexts.append(txt[:2000])
+    global_context = "\n\n".join(global_contexts)
+
+    if global_context:
+        rag_answer = _answer_from_context(global_context)
+        if not _is_low_confidence_answer(rag_answer):
+            return {
+                "answer": rag_answer,
+                "sources": global_sources,
+                "mode": "rag_global",
+                "fallback_used": True,
+                "doc_found": doc_found,
+                "message": "Selected document context was unavailable/insufficient, answered via global RAG.",
+            }
+
+    # 3) Final fallback: direct AI guidance with explicit no-doc-match notice
+    final_answer = _ai_fallback_answer()
+    return {
+        "answer": final_answer,
+        "sources": global_sources or doc_sources or [],
+        "mode": "ai_fallback",
+        "fallback_used": True,
+        "doc_found": doc_found,
+        "message": "Document fetch/RAG did not produce a confident answer; used AI fallback.",
+    }
 
 @router.post("/exec")
 async def exec_function(
@@ -178,9 +308,9 @@ async def exec_function(
         req = AIRequest(text=text or "", question=question)
         return await ai_response(req, user)
     if fname == "chat_rag":
-        if not doc_id or not question:
-            raise HTTPException(status_code=400, detail="doc_id and question are required")
-        return await chat_rag(doc_id, question, user)
+        if not question:
+            raise HTTPException(status_code=400, detail="question is required")
+        return await chat_rag(doc_id or "", question, user)
     if fname == "start_analysis":
         req = StartRequest(email=email or "", uploadedDocumentId=uploadedDocumentId)
         return await start_analysis(req)
@@ -221,51 +351,23 @@ async def translate_analyze(
         engine = (engine or "auto").lower()
         force_openai = engine == "openai"
         force_local = engine == "local"
+        
         if not src_text.strip():
             translated = ""
-        elif force_local or (not force_openai and (_prefer_local_translation or not is_openai_ready())):
-            def _detect_script(text: str) -> str:
-                for ch in text:
-                    o = ord(ch)
-                    if 0x0B80 <= o <= 0x0BFF:
-                        return "tam"
-                    if 0x0900 <= o <= 0x097F:
-                        return "hin"
-                return "eng"
-            def _marian_model_for(target: str, source_hint: str) -> Optional[str]:
-                t = (target or "").lower()
-                s = (source_hint or "").lower()
-                if t.startswith("english"):
-                    if "tam" in s:
-                        return "Helsinki-NLP/opus-mt-ta-en"
-                    if "hin" in s:
-                        return "Helsinki-NLP/opus-mt-hi-en"
-                return None
-            def _translate_marian(text: str, target: str, source_hint: str) -> Optional[str]:
-                model_name = _marian_model_for(target, source_hint)
-                if not model_name:
-                    auto = _detect_script(text)
-                    model_name = _marian_model_for(target, auto)
-                if not model_name:
-                    return None
-                try:
-                    from transformers import MarianMTModel, MarianTokenizer
-                except Exception:
-                    return None
-                tok = MarianTokenizer.from_pretrained(model_name)
-                mdl = MarianMTModel.from_pretrained(model_name)
-                chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
-                outs = []
-                for c in chunks:
-                    enc = tok([c], return_tensors="pt", padding=True, truncation=True)
-                    gen = mdl.generate(**enc, max_length=900)
-                    outs.append(tok.decode(gen[0], skip_special_tokens=True))
-                return "\n".join(outs).strip()
-            fb = await asyncio.to_thread(_translate_marian, src_text, target_lang, eff_lang)
-            translated = (fb or src_text)
-            if fb is None:
-                warnings.append("Local translator unavailable; showing original text.")
+        elif force_local or (not force_openai and (os.getenv("USE_LOCAL_TRANSLATION_FIRST", "0") == "1" or not is_openai_ready())):
+            # Use stateful TranslationService
+            chunks = sentence_safe_chunk(src_text, max_chars=1000)
+            try:
+                # Detect dominant language for the entire document for local translation
+                doc_lang, _ = detect_language_with_confidence(src_text)
+                translated_chunks = await translation_service.translate_batch(chunks, doc_lang, target_lang)
+                translated = " ".join(translated_chunks)
+            except Exception as e:
+                print(f"[DEBUG] Local translation failed in route: {e}")
+                translated = src_text
+                warnings.append("Local translation failed; showing original text.")
         else:
+            # OpenAI path...
             prompt = (
                 f"Translate to {target_lang} preserving legal meaning and structure. "
                 "Return only translated text.\n\n" + src_text[:6000]
@@ -303,63 +405,22 @@ async def translate_analyze(
                         continue
                     raise
     except Exception as e:
-        # Fallback logic if the primary translation (OpenAI or Local) fails
-        def _detect_script_fallback(text: str) -> str:
-            for ch in text:
-                o = ord(ch)
-                if 0x0B80 <= o <= 0x0BFF:
-                    return "tam"
-                if 0x0900 <= o <= 0x097F:
-                    return "hin"
-            return "eng"
-        def _marian_model_for_fallback(target: str, source_hint: str) -> Optional[str]:
-            t = (target or "").lower()
-            s = (source_hint or "").lower()
-            if t.startswith("english"):
-                if "tam" in s:
-                    return "Helsinki-NLP/opus-mt-ta-en"
-                if "hin" in s:
-                    return "Helsinki-NLP/opus-mt-hi-en"
-            return None
-        def _translate_marian_fallback(text: str, target: str, source_hint: str) -> Optional[str]:
-            model_name = _marian_model_for_fallback(target, source_hint)
-            if not model_name:
-                auto = _detect_script_fallback(text)
-                model_name = _marian_model_for_fallback(target, auto)
-            if not model_name:
-                return None
-            try:
-                from transformers import MarianMTModel, MarianTokenizer
-            except Exception:
-                return None
-            tok = MarianTokenizer.from_pretrained(model_name)
-            mdl = MarianMTModel.from_pretrained(model_name)
-            chunks = [text[i:i+2000] for i in range(0, len(text), 2000)]
-            outs = []
-            for c in chunks:
-                enc = tok([c], return_tensors="pt", padding=True, truncation=True)
-                gen = mdl.generate(**enc, max_length=900)
-                outs.append(tok.decode(gen[0], skip_special_tokens=True))
-            return "\n".join(outs).strip()
-        
-        # We need src_text here, so ensure it's defined or empty
+        # Final fallback using stateless MyMemory logic from nlp.py or local translation
         st = src_text if 'src_text' in locals() else ""
-        fb = None
         try:
-            fb = await asyncio.to_thread(_translate_marian_fallback, st, target_lang, eff_lang if 'eff_lang' in locals() else "auto")
+            doc_lang, _ = detect_language_with_confidence(st)
+            chunks = sentence_safe_chunk(st, max_chars=1000)
+            # Try local translation as first fallback
+            translated_chunks = await translation_service.translate_batch(chunks, doc_lang, target_lang)
+            translated = " ".join(translated_chunks)
         except Exception:
-            fb = None
-        translated = fb or st
-        msg_raw = str(e)
-        msg = msg_raw.lower()
-        if "insufficient_quota" in msg or "you exceeded your current quota" in msg or "openai_quota_exhausted" in msg:
-            warnings.append("OpenAI quota exceeded. Using local translator if available.")
-        elif "openai_not_configured" in msg or "api key" in msg or "authentication" in msg:
-            warnings.append("OpenAI API key missing or invalid. Using local translator if available.")
-        elif "timed out" in msg or "timeout" in msg:
-            warnings.append("Translation timed out. Using local translator if available.")
+            translated = st
+        
+        msg = str(e).lower()
+        if "insufficient_quota" in msg or "exceeded your current quota" in msg:
+            warnings.append("OpenAI quota exceeded. Used local translation.")
         else:
-            warnings.append(f"Translation failed: {str(e)}. Using local translator if available.")
+            warnings.append(f"Translation failed: {str(e)}. Used fallback.")
     finally:
         if path and os.path.exists(path):
             try:

@@ -159,6 +159,7 @@ if _disable_mongo:
     db = None
     documents_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_documents.json"))
     users_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_users.json"))
+    pipeline_jobs_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_pipeline_jobs.json"))
 else:
     try:
         client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=2000)
@@ -166,8 +167,13 @@ else:
         db = client[DB_NAME]
         documents_collection = db["documents"]
         users_collection = db["users"]
+        pipeline_jobs_collection = db["pipeline_jobs"]
         try:
             documents_collection.create_index([("doc_id", ASCENDING)], unique=True)
+        except Exception:
+            pass
+        try:
+            pipeline_jobs_collection.create_index([("job_id", ASCENDING)], unique=True)
         except Exception:
             pass
     except Exception:
@@ -175,3 +181,4 @@ else:
         db = None
         documents_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_documents.json"))
         users_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_users.json"))
+        pipeline_jobs_collection = LocalCollection(os.path.join(os.getcwd(), "local_db_pipeline_jobs.json"))

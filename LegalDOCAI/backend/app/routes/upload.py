@@ -18,8 +18,22 @@ def _sse(d):
     try: return f"data: {json.dumps(d)}\n\n"
     except Exception: return "data: {}\n\n"
 
+async def _run_pipeline_compat(doc_id: str, debug: bool = False):
+    # Backward-compat: allow monkeypatched/legacy run_full_pipeline(doc_id)
+    # while supporting the newer run_full_pipeline(doc_id, debug=...).
+    try:
+        return await run_full_pipeline(doc_id, debug=debug)
+    except TypeError:
+        return await run_full_pipeline(doc_id)
+
 @router.post("/upload")
-async def upload_file(file: UploadFile = File(...), ocr_lang: str = Form(None), ocr_engine: str = Form(None), user: dict = Depends(get_current_user)):
+async def upload_file(
+    file: UploadFile = File(...),
+    ocr_lang: str = Form(None),
+    ocr_engine: str = Form(None),
+    debug: bool = Form(False),
+    user: dict = Depends(get_current_user),
+):
     """Upload, scan, analyze, verify and save document"""
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file selected.")
@@ -49,6 +63,7 @@ async def upload_file(file: UploadFile = File(...), ocr_lang: str = Form(None), 
     doc_data = {
         "doc_id": doc_id,
         "filename": file.filename,
+        "file_path": file_path,
         "results": [], # To be filled by pipeline
         "analytics": {}, # To be filled by pipeline
         "combined_text": full_text,
@@ -58,12 +73,18 @@ async def upload_file(file: UploadFile = File(...), ocr_lang: str = Form(None), 
     collection.insert_one(doc_data)
 
     # 5. Run Full Pipeline
-    pipeline_result = await run_full_pipeline(doc_id)
+    pipeline_result = await _run_pipeline_compat(doc_id, debug=debug)
     
     return JSONResponse(pipeline_result)
 
 @router.post("/upload-stream")
-async def upload_stream(file: UploadFile = File(...), ocr_lang: str = Form(None), ocr_engine: str = Form(None), user: dict = Depends(get_current_user)):
+async def upload_stream(
+    file: UploadFile = File(...),
+    ocr_lang: str = Form(None),
+    ocr_engine: str = Form(None),
+    debug: bool = Form(False),
+    user: dict = Depends(get_current_user),
+):
     """Upload with live server-side progress via text/event-stream"""
     if not file or not file.filename:
         raise HTTPException(status_code=400, detail="No file selected.")
@@ -99,6 +120,8 @@ async def upload_stream(file: UploadFile = File(...), ocr_lang: str = Form(None)
         doc_data = {
             "doc_id": doc_id,
             "filename": file.filename,
+            "file_path": file_path,
+            "results": [],
             "combined_text": full_text
         }
         collection.insert_one(doc_data)
@@ -106,12 +129,24 @@ async def upload_stream(file: UploadFile = File(...), ocr_lang: str = Form(None)
         yield _sse({"stage":"analyzing", "message": "Running full analysis pipeline..."})
         
         # Run Pipeline
-        pipeline_result = await run_full_pipeline(doc_id)
+        pipeline_result = await _run_pipeline_compat(doc_id, debug=debug)
         analytics = pipeline_result.get("analytics", {})
+        debug_payload = pipeline_result.get("_debug")
         
         yield _sse({"stage":"analyzed","legality_score":analytics.get("legality_score")})
-        yield _sse({"stage":"verified","marker":analytics.get("verified_marker"),"confidence":analytics.get("ai_confidence")})
-        yield _sse({"stage":"done","doc_id": doc_id})
+        yield _sse({
+            "stage":"verified",
+            "marker":analytics.get("verified_marker"),
+            "confidence":analytics.get("ai_confidence"),
+            "anomaly_detected": analytics.get("anomaly_detected"),
+            "anomaly_reason": analytics.get("anomaly_reason"),
+            "fraud_flag": analytics.get("fraud_flag"),
+            "fraud_reason": analytics.get("fraud_reason"),
+        })
+        done_payload = {"stage": "done", "doc_id": doc_id}
+        if debug_payload:
+            done_payload["debug"] = debug_payload
+        yield _sse(done_payload)
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 
